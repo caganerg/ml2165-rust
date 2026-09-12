@@ -9,6 +9,9 @@ ml2165-rust (1.1.0-1) stable; urgency=medium
     filter binary name (rastertospl-rust) is unchanged.
   * Take the *ImageableArea margins from upstream SpliX ml2165.ppd: 12.5 pt
     on every edge instead of 12 pt.
+  * Build the filter against glibc instead of statically against musl, and
+    declare the resulting runtime dependencies (libc6, libgcc-s1). Supported
+    platforms are Debian 13 (trixie) and Debian 14.
 
  -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Sat, 12 Sep 2026 14:30:00 +0300
 

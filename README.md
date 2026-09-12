@@ -95,12 +95,21 @@ lp -d ML2165_Rust file.pdf
 
 ## Debian package (.deb)
 
-Debian 13 (trixie) and later can install the driver as a package, which
-replaces step 3 above and hands step 4 a system PPD path. The filter is
-compiled against **musl** and linked statically, so the binary in the package
-carries no libc dependency and runs unchanged on Debian 13, on later releases
-and on derivatives; the only declared dependencies are `cups` and
-`cups-filters`.
+Debian 13 (trixie) and Debian 14 can install the driver as a package, which
+replaces step 3 above and hands step 4 a system PPD path. The filter is an
+ordinary **glibc** build — it uses no third-party crates, so the only things it
+links against are the C runtime and `libgcc_s`. That is what the declared
+dependencies say: `cups`, `cups-filters`, `libc6 (>= 2.34)` and
+`libgcc-s1 (>= 4.2)`. Both Debian releases ship a glibc newer than that, so a
+package built on Debian 13 installs unchanged on Debian 14.
+
+If you extend the filter, re-derive those two versions from the binary you are
+about to ship rather than trusting the numbers above:
+
+```sh
+objdump -T target/release/rastertospl-rust | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+objdump -T target/release/rastertospl-rust | grep -o 'GCC_[0-9.]*'   | sort -uV | tail -1
+```
 
 The package installs two files — `/usr/lib/cups/filter/rastertospl-rust` and
 `/usr/share/ppd/ml2165-rust/samsung-ml2165.ppd` — plus the usual
@@ -115,8 +124,7 @@ below has to match. The ownership warning in step 1 applies here too — the
 package embeds the filter binary that CUPS will later run as user `lp`.
 
 ```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release
 
 REPO=$PWD
 VERSION=1.1.0-1
@@ -126,7 +134,7 @@ mkdir -p "$BUILD"/root/usr/lib/cups/filter \
          "$BUILD"/root/usr/share/ppd/ml2165-rust \
          "$BUILD"/root/"$DOC" "$BUILD"/control
 
-install -m 755 target/x86_64-unknown-linux-musl/release/rastertospl-rust \
+install -m 755 target/release/rastertospl-rust \
     "$BUILD/root/usr/lib/cups/filter/rastertospl-rust"
 install -m 644 ppd/samsung-ml2165.ppd \
     "$BUILD/root/usr/share/ppd/ml2165-rust/samsung-ml2165.ppd"
@@ -143,7 +151,7 @@ awk -v s="$(du -sk --apparent-size "$BUILD/root" | cut -f1)" \
 chmod 644 "$BUILD/control/control" "$BUILD/control/md5sums"
 
 printf '2.0\n' > "$BUILD/debian-binary"
-TARFLAGS="--owner=root --group=root --numeric-owner --sort=name --mtime=@0"
+TARFLAGS="--owner=root --group=root --numeric-owner --sort=name --mtime=@0 --mode=go-w"
 tar $TARFLAGS -C "$BUILD/root"    -cf - . | xz -9e > "$BUILD/data.tar.xz"
 tar $TARFLAGS -C "$BUILD/control" -cf - . | xz -9e > "$BUILD/control.tar.xz"
 
@@ -154,6 +162,9 @@ mkdir -p "$REPO/dist"
 
 The `--owner=root --group=root --numeric-owner` flags are not cosmetic: they are
 what makes the installed filter root-owned regardless of who built the package.
+`--mode=go-w` is there for the same reason — without it the directories inherit
+the build user's umask, and a `.deb` built under a 002 umask would install
+group-writable directories under `/usr/lib/cups/filter` and `/usr/share/ppd`.
 
 ### Install it and register the queue
 

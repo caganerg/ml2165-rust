@@ -3,7 +3,7 @@ Version: 1.1.0-1
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: cups (>= 2.4), cups-filters
+Depends: cups (>= 2.4), cups-filters, libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Maintainer: CUPS Raster Filter Developer <caganergun@tutanota.com>
 Homepage: https://github.com/caganerg/ml2165-rust
 Description: CUPS raster filter for the Samsung ML-2165 printer
@@ -13,6 +13,7 @@ Description: CUPS raster filter for the Samsung ML-2165 printer
  RLE-compressed band records and checksums. The printer is driven over USB;
  network and wireless models are out of scope.
  .
- The package ships the filter binary and the matching PPD. The filter is
- statically linked against musl, so it carries no libc dependency of its own
- and runs unchanged on Debian 13 (trixie) and later.
+ The package ships the filter binary and the matching PPD. The filter is an
+ ordinary glibc build that pulls in no third-party crates, so beyond the C
+ runtime it needs nothing that Debian 13 (trixie) and Debian 14 do not already
+ provide.
