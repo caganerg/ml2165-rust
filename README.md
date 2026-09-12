@@ -1,6 +1,12 @@
 # ml2165-rust
-> [!WARNING]
-> **Experimental Driver:** This project is currently in active development and should be considered experimental. Use at your own risk. Feedback, bug reports, and pull requests are highly appreciated!
+
+> [!NOTE]
+> **Status: complete.** The driver does what it set out to do and is verified on
+> the hardware it targets. The 101 unit tests pass, and the PPD's page geometry
+> was checked physically: an A4 test page with a 100 mm calibration bar and a
+> frame 20 mm from each paper edge was printed and measured with a ruler, and
+> the margins came out on size. No further development is planned — bug reports
+> and pull requests are still welcome.
 
 A CUPS raster filter (`rastertospl-rust`) for the Samsung ML-2165 monochrome laser printer, written in Rust. It converts CUPS's standard raster stream (`RaSt`/`RaS2`/`RaS3`) into the printer's native binary **SPL2 / QPDL v3** format: PJL job envelope, 17-byte page header, Algo 0x11 RLE-compressed band records, and checksums.
 
@@ -16,13 +22,21 @@ model.
 
 - Rust toolchain (`cargo`)
 - CUPS (`lpadmin`, `lpinfo`, `cupstestppd`)
+- `ar`, `tar`, `xz` and `gzip` to build the package — `dpkg-dev` is not needed
 - Printer powered on and attached over USB
 
 ## Installation
 
-There is no install script — the steps below *are* the procedure. Run them from
-the repository root as your normal user: only the two `sudo` lines write to
-system paths, so **don't run the whole sequence as root**.
+The Debian package is the supported way to install this driver. It puts the
+filter and the PPD where CUPS expects them, registers the PPD in CUPS' own
+driver database so the graphical tools can offer it by model name, and comes
+back out with `apt remove`. The target platforms are Debian 13 (trixie) and
+Debian 14. On anything else — or when working on the filter itself — use
+[Manual installation](#manual-installation) further down instead.
+
+There is no install script: the steps below *are* the procedure. Run them from
+the repository root as your normal user. Only the `sudo` lines write to system
+paths, so **don't run the whole sequence as root**.
 
 ### 1. Check that the repository path is under your control
 
@@ -40,88 +54,24 @@ end up compiled into the binary, and `ppd/` into the installed PPD:
 find . -path ./target -prune -o -perm /022 -print
 ```
 
-This is not boilerplate caution. Steps 3 and 4 copy the filter binary and the
-PPD into system locations **as root**, and a PPD is not a passive config file: its
-`*cupsFilter`/`*cupsFilter2` line names the program CUPS executes for every
-print job, as user `lp`. Anyone who can write into the repository — or replace
-any directory above it — can therefore have a program of their own installed as
-a root-owned CUPS filter.
+This is not boilerplate caution. The package built in step 2 embeds the filter
+binary, and step 3 installs it **as root**. A PPD is not a passive config file
+either: its `*cupsFilter`/`*cupsFilter2` line names the program CUPS executes
+for every print job, as user `lp`. Anyone who can write into the repository — or
+replace any directory above it — can therefore have a program of their own
+installed as a root-owned CUPS filter.
 
-### 2. Find your printer's device URI
+### 2. Build the package
 
-```sh
-lpinfo -v
-```
-
-Copy the URI from the second column of the line matching your printer. For a
-USB ML-2165 it looks like `usb://Samsung/ML-2165%20Series?serial=...`; the
-serial number is your printer's own, so the line has to be read off `lpinfo -v`
-rather than copied from here:
-
-```sh
-DEVICE_URI="usb://Samsung/ML-2165%20Series?serial=Z1A2B3C4D5"
-```
-
-Keep it quoted everywhere: `usb://` URIs contain `?` and `&`, which the shell would otherwise interpret.
-
-### 3. Build, install the filter, validate the PPD
-
-```sh
-cargo build --release
-sudo install -m 755 -o root -g root \
-    target/release/rastertospl-rust /usr/lib/cups/filter/rastertospl-rust
-cupstestppd ppd/samsung-ml2165.ppd
-```
-
-- **Use `install`, not `cp`.** The `-m 755 -o root -g root` flags matter: a filter that is writable by a non-root user is a filter someone else can replace.
-- **Run `cupstestppd` after the binary is in place.** It checks that the file referenced by the PPD's `cupsFilter`/`cupsFilter2` line actually exists, so running it first reports a failure that isn't real.
-
-### 4. Register the CUPS queue
-
-```sh
-sudo lpadmin -p ML2165_Rust -E -v "$DEVICE_URI" -P ppd/samsung-ml2165.ppd
-```
-
-`ML2165_Rust` is the queue name and is yours to choose; CUPS allows at most 127 characters and rejects spaces, `/` and `#`, so stick to letters, digits, `_`, `.` and `-`.
-
-Then send a test print:
-
-```sh
-lp -d ML2165_Rust file.pdf
-```
-
-> [!NOTE]
-> Pick the device URI yourself rather than letting anything auto-detect it. CUPS device discovery is unauthenticated: a USB device reports its own manufacturer and model in its descriptor strings, so anything plugged in can claim to be a "Samsung ML-2165" and be wired up as the print destination, silently receiving your documents. Reading `lpinfo -v` and choosing the line yourself is the review step that prevents this.
-
-## Debian package (.deb)
-
-Debian 13 (trixie) and Debian 14 can install the driver as a package, which
-replaces step 3 above and hands step 4 a system PPD path. The filter is an
-ordinary **glibc** build — it uses no third-party crates, so the only things it
-links against are the C runtime and `libgcc_s`. That is what the declared
-dependencies say: `cups`, `cups-filters`, `libc6 (>= 2.34)` and
+The filter is an ordinary **glibc** build — it uses no third-party crates, so
+the only things it links against are the C runtime and `libgcc_s`. That is what
+the declared dependencies say: `cups`, `cups-filters`, `libc6 (>= 2.34)` and
 `libgcc-s1 (>= 4.2)`. Both Debian releases ship a glibc newer than that, so a
 package built on Debian 13 installs unchanged on Debian 14.
 
-If you extend the filter, re-derive those two versions from the binary you are
-about to ship rather than trusting the numbers above:
-
-```sh
-objdump -T target/release/rastertospl-rust | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
-objdump -T target/release/rastertospl-rust | grep -o 'GCC_[0-9.]*'   | sort -uV | tail -1
-```
-
-The package installs two files — `/usr/lib/cups/filter/rastertospl-rust` and
-`/usr/share/ppd/ml2165-rust/samsung-ml2165.ppd` — plus the usual
-documentation under `/usr/share/doc/`. It does **not** create a print queue.
-
-### Build it
-
-`dpkg-dev` is not needed: a `.deb` is an `ar` archive of three members, and
-`ar`, `tar`, `xz` and `gzip` are enough to produce one. The control metadata
-lives in `packaging/debian/` and its `Version:` field is what the file name
-below has to match. The ownership warning in step 1 applies here too — the
-package embeds the filter binary that CUPS will later run as user `lp`.
+A `.deb` is an `ar` archive of three members, and `ar`, `tar`, `xz` and `gzip`
+are enough to produce one. The control metadata lives in `packaging/debian/`
+and its `Version:` field is what the file name below has to match.
 
 ```sh
 cargo build --release
@@ -166,22 +116,63 @@ what makes the installed filter root-owned regardless of who built the package.
 the build user's umask, and a `.deb` built under a 002 umask would install
 group-writable directories under `/usr/lib/cups/filter` and `/usr/share/ppd`.
 
-### Install it and register the queue
+Check the result before installing it:
+
+```sh
+dpkg-deb -I dist/ml2165-rust_1.1.0-1_amd64.deb    # control metadata
+dpkg-deb -c dist/ml2165-rust_1.1.0-1_amd64.deb    # paths, owners, modes
+```
+
+Everything in the listing must be `root/root`, the filter `755` and the data
+files `644`.
+
+If you extend the filter, re-derive the two library versions in
+`packaging/debian/control` from the binary you are about to ship rather than
+trusting the numbers there:
+
+```sh
+objdump -T target/release/rastertospl-rust | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+objdump -T target/release/rastertospl-rust | grep -o 'GCC_[0-9.]*'   | sort -uV | tail -1
+```
+
+### 3. Install the package
 
 ```sh
 sudo apt install ./dist/ml2165-rust_1.1.0-1_amd64.deb
-sudo lpadmin -p ML2165_Rust -E -v "$DEVICE_URI" \
-    -P /usr/share/ppd/ml2165-rust/samsung-ml2165.ppd
 ```
 
-`$DEVICE_URI` comes from step 2 above. Use `apt install ./…` rather than
-`dpkg -i` so that `cups` and `cups-filters` are pulled in if they are missing.
+Use `apt install ./…` rather than `dpkg -i` so that `cups` and `cups-filters`
+are pulled in if they are missing.
 
-Because the PPD now lives under `/usr/share/ppd/`, CUPS lists it as a model in
-its own driver database, so you can name it by model instead of by path — and
-the graphical tools (CUPS' web interface at <http://localhost:631> →
-*Administration* → *Add Printer*, or GNOME/KDE printer settings) offer it under
-*Samsung ML-2165 Series, Rust SPL2 Driver* once the package is installed:
+The package installs two files — `/usr/lib/cups/filter/rastertospl-rust` and
+`/usr/share/ppd/ml2165-rust/samsung-ml2165.ppd` — plus the usual documentation
+under `/usr/share/doc/`. It does **not** create a print queue; that is step 5.
+
+### 4. Find your printer's device URI
+
+```sh
+lpinfo -v
+```
+
+Copy the URI from the second column of the line matching your printer. For a
+USB ML-2165 it looks like `usb://Samsung/ML-2165%20Series?serial=...`; the
+serial number is your printer's own, so the line has to be read off `lpinfo -v`
+rather than copied from here:
+
+```sh
+DEVICE_URI="usb://Samsung/ML-2165%20Series?serial=Z1A2B3C4D5"
+```
+
+Keep it quoted everywhere: `usb://` URIs contain `?` and `&`, which the shell would otherwise interpret.
+
+> [!NOTE]
+> Pick the device URI yourself rather than letting anything auto-detect it. CUPS device discovery is unauthenticated: a USB device reports its own manufacturer and model in its descriptor strings, so anything plugged in can claim to be a "Samsung ML-2165" and be wired up as the print destination, silently receiving your documents. Reading `lpinfo -v` and choosing the line yourself is the review step that prevents this.
+
+### 5. Register the CUPS queue
+
+Because the package puts the PPD under `/usr/share/ppd/`, CUPS lists it as a
+model in its own driver database, so the queue can name it by model instead of
+by path:
 
 ```sh
 lpinfo -m | grep -i ml-2165      # ml2165-rust/samsung-ml2165.ppd …
@@ -189,16 +180,51 @@ sudo lpadmin -p ML2165_Rust -E -v "$DEVICE_URI" \
     -m ml2165-rust/samsung-ml2165.ppd
 ```
 
-The device URI still has to be chosen — the USB serial number is a property of
-your printer, not of the package, so nothing that ships in the `.deb` can know
-it. What the graphical dialogs save you is the typing, not the choice: they show
-the detected USB device as a line you click, which is the same deliberate pick
-the note in step 2 asks for.
+`ML2165_Rust` is the queue name and is yours to choose; CUPS allows at most 127 characters and rejects spaces, `/` and `#`, so stick to letters, digits, `_`, `.` and `-`.
 
-To remove it, delete the queues first (`sudo lpadmin -x ML2165_Rust`, see
-[Uninstallation](#uninstallation)) and then `sudo apt remove ml2165-rust`
-— `apt remove` takes the filter away from every queue built on it, including any
-it did not create.
+Then send a test print:
+
+```sh
+lp -d ML2165_Rust file.pdf
+```
+
+The same driver shows up in the graphical tools (CUPS' web interface at
+<http://localhost:631> → *Administration* → *Add Printer*, or GNOME/KDE printer
+settings) as *Samsung ML-2165 Series, Rust SPL2 Driver*. What those dialogs save
+you is the typing, not the choice: they show the detected USB device as a line
+you click, which is the same deliberate pick the note in step 4 asks for.
+
+## Manual installation
+
+Use this route only if the package is not an option — another distribution, or
+a working copy of the filter you are still changing. It installs the same two
+files by hand, which means `apt` cannot remove them again; see
+[Uninstallation](#uninstallation).
+
+Steps 1 and 4 of the package route above still apply: check the repository
+ownership first, and have `$DEVICE_URI` ready.
+
+### 1. Build the filter, install it, validate the PPD
+
+```sh
+cargo build --release
+sudo install -m 755 -o root -g root \
+    target/release/rastertospl-rust /usr/lib/cups/filter/rastertospl-rust
+cupstestppd ppd/samsung-ml2165.ppd
+```
+
+- **Use `install`, not `cp`.** The `-m 755 -o root -g root` flags matter: a filter that is writable by a non-root user is a filter someone else can replace.
+- **Run `cupstestppd` after the binary is in place.** It checks that the file referenced by the PPD's `cupsFilter`/`cupsFilter2` line actually exists, so running it first reports a failure that isn't real.
+
+### 2. Register the CUPS queue against the PPD in the repository
+
+```sh
+sudo lpadmin -p ML2165_Rust -E -v "$DEVICE_URI" -P ppd/samsung-ml2165.ppd
+```
+
+`-P` copies the PPD into `/etc/cups/ppd/` for that queue, so the queue keeps
+working if the repository moves — but CUPS will not list this driver as a model
+for other queues the way the package does.
 
 ## Print options
 
@@ -240,11 +266,11 @@ lpoptions -d ML2165_Rust -l            # list every option and its choices
 > raster geometry it was being handed — misaligned output, or a feed from the
 > wrong tray. Such a failure usually means that the queue is using a different
 > PPD than `ppd/samsung-ml2165.ppd`, or that it received a malformed raster
-> stream; first re-run the `lpadmin` command from step 4 to confirm the PPD.
+> stream; first re-run the `lpadmin` command from step 5 to confirm the PPD.
 
 > [!IMPORTANT]
 > If you installed an earlier version of this PPD, re-run the `lpadmin` command
-> from step 4 to load the current one. The older PPD offered paper types under
+> from step 5 to load the current one. The older PPD offered paper types under
 > readable names (`Plain`, `Envelope`, …) that never reached the printer, and a
 > third paper source ("Tray 1") that does not exist on this hardware. Saved
 > defaults referring to those names (`lpoptions -o MediaType=Plain`) are no
@@ -259,9 +285,9 @@ lpstat -p                       # if you're unsure of the name
 sudo lpadmin -x ML2165_Rust
 ```
 
-### 2. Remove the filter binary, but only once nothing still uses it
+### 2. Remove the driver, but only once nothing still uses it
 
-The binary is shared by every queue built on this driver, so deleting it while
+The filter is shared by every queue built on this driver, so removing it while
 another one is still installed breaks that queue silently — its jobs start
 failing with "filter failed". Ask which installed PPDs still name the filter:
 
@@ -270,7 +296,14 @@ sudo grep -rlsF rastertospl-rust /etc/cups/ppd/
 ```
 
 `lpadmin -x` already deleted the removed queue's own PPD, so it won't appear
-here. If the command prints nothing, no queue needs the filter any more:
+here. If the command prints nothing, no queue needs the filter any more. If the
+driver came from the package, that is all `apt` needs:
+
+```sh
+sudo apt remove ml2165-rust
+```
+
+If it was installed by hand, delete the binary the same way:
 
 ```sh
 sudo rm -f /usr/lib/cups/filter/rastertospl-rust
