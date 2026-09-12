@@ -1,0 +1,26 @@
+ml2165-rust (1.1.0-1) stable; urgency=medium
+
+  * Narrow the driver to the USB-attached Samsung ML-2165: the ML-2160,
+    ML-2165W and ML-2168 product entries are gone from the PPD, and the
+    documentation no longer describes network or Wi-Fi setups.
+  * Rename the source and binary package from samsung-ml2160-rust; the PPD
+    ships as samsung-ml2165.ppd under /usr/share/ppd/ml2165-rust/.
+    Existing queues keep working until they are re-registered, because the
+    filter binary name (rastertospl-rust) is unchanged.
+  * Take the *ImageableArea margins from upstream SpliX ml2165.ppd: 12.5 pt
+    on every edge instead of 12 pt.
+
+ -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Sat, 12 Sep 2026 14:30:00 +0300
+
+samsung-ml2160-rust (1.0.2-1) stable; urgency=medium
+
+  * Release version 1.0.2.
+
+ -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Fri, 04 Sep 2026 23:59:35 +0300
+
+samsung-ml2160-rust (1.0.1-1) stable; urgency=medium
+
+  * Initial Debian package: statically linked (musl) filter binary plus the
+    PPD, targeting Debian 13 (trixie) and later.
+
+ -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Tue, 01 Sep 2026 00:00:00 +0000
