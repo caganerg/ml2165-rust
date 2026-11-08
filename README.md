@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status: complete.** The driver does what it set out to do and is verified on
-> the hardware it targets. The 106 unit tests pass, and the PPD's page geometry
+> the hardware it targets. The 86 unit tests pass, and the PPD's page geometry
 > was checked physically: an A4 test page with a 100 mm calibration bar and a
 > frame 20 mm from each paper edge was printed and measured with a ruler, and
 > the margins came out on size. No further development is planned — bug reports
@@ -278,6 +278,10 @@ lpoptions -d ML2165_Rust -l            # list every option and its choices
 > defaults referring to those names (`lpoptions -o MediaType=Plain`) are no
 > longer valid choices and should be set again.
 
+The filter puts no limit on the length of a job. If you want one, use CUPS'
+own per-queue quotas, e.g.
+`sudo lpadmin -p ML2165_Rust -o job-page-limit=500 -o job-quota-period=86400`.
+
 ## Uninstallation
 
 ### 1. Remove the queue
@@ -321,11 +325,11 @@ itself, so it says nothing about which driver the queue was built with.
 cargo test
 ```
 
-106 unit tests cover the CUPS Raster parser (v1/v2/v3, both endiannesses, the
-v2 line-RLE decoder), page-header validation, the SPL2/QPDL record layout, the
-horizontal band placement, the Algo 0x11 RLE round trip, PJL field sanitisation,
-job cancellation (SIGTERM before, between and in the middle of pages), and every
-resource limit the filter enforces.
+86 unit tests cover the CUPS Raster parser (v1/v2/v3, both endiannesses, the
+v2 line-RLE decoder), page-header validation and the size limits that bound
+memory use, the SPL2/QPDL record layout, the horizontal band placement, the
+Algo 0x11 RLE round trip, PJL field sanitisation, and job cancellation (SIGTERM
+before, between and in the middle of pages).
 
 Several of them are pinned against measurements from real `cupsfilter` output
 rather than from the specification — `test_validate_page_header_accepts_real_cupsfilter_heights`
