@@ -2,7 +2,10 @@
 name = "ml2165-rust"
 version = "1.1.0"
 edition = "2021"
-authors = ["CUPS Raster Filter Developer"]
+# The .deb is built on the maintainer's Debian 14 machine with its packaged
+# rustc; building on Debian 13 (rustc 1.85) is not a goal. The resulting
+# binary still installs on Debian 13 -- see packaging/debian/control.
+rust-version = "1.97.1"
 description = "CUPS raster filter for the Samsung ML-2165 (SPL2 / QPDL v3)"
 license = "GPL-2.0-only"
 

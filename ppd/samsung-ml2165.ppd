@@ -23,8 +23,9 @@
 *LandscapeOrientation: Plus90
 *TTRasterizer: Type42
 *% The printer reports its own model in MDL, so this ID is only a fallback;
-*% the queue is created by assigning this PPD manually via `lpadmin -P`, so
-*% exact 1284DeviceID matching isn't required.
+*% the queue is created by naming this driver explicitly -- `lpadmin -m
+*% ml2165-rust/samsung-ml2165.ppd` after installing the package, or `lpadmin -P`
+*% for a manual install -- so exact 1284DeviceID matching isn't required.
 *1284DeviceID: "MFG:Samsung;MDL:ML-2165 Series;CMD:SPL,FWV,EXT;"
 
 *% ============================================================================

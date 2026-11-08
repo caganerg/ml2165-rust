@@ -20,7 +20,9 @@ model.
 
 ## Requirements
 
-- Rust toolchain (`cargo`)
+- Rust toolchain (`cargo`), 1.97.1 or newer — `Cargo.toml` declares it as
+  `rust-version`, so an older `cargo` refuses to build. The installed package
+  itself still runs on Debian 13; only building it there is unsupported.
 - CUPS (`lpadmin`, `lpinfo`, `cupstestppd`)
 - `ar`, `tar`, `xz` and `gzip` to build the package — `dpkg-dev` is not needed
 - Printer powered on and attached over USB

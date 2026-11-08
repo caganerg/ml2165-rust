@@ -853,7 +853,7 @@ fn process_cups_raster_to_spl<W: Write>(
         //   bandWidthInB = lineWidthInB = (pageWidth + 7) / 8
         //   bandWidth = bandWidthInB * 8
         // ML-2165 için 256-hizalama kullanılmıyor.
-        let band_width_bytes = (page_width_pixels + 7) / 8;
+        let band_width_bytes = page_width_pixels.div_ceil(8);
         let band_width_pixels = band_width_bytes * 8;
 
         // QPDL sayfa/bant kayıtlarındaki genişlik ve yükseklik alanları
