@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > **Status: complete.** The driver does what it set out to do and is verified on
-> the hardware it targets. The 101 unit tests pass, and the PPD's page geometry
+> the hardware it targets. The 106 unit tests pass, and the PPD's page geometry
 > was checked physically: an A4 test page with a 100 mm calibration bar and a
 > frame 20 mm from each paper edge was printed and measured with a ruler, and
 > the margins came out on size. No further development is planned — bug reports
@@ -321,10 +321,11 @@ itself, so it says nothing about which driver the queue was built with.
 cargo test
 ```
 
-101 unit tests cover the CUPS Raster parser (v1/v2/v3, both endiannesses, the
+106 unit tests cover the CUPS Raster parser (v1/v2/v3, both endiannesses, the
 v2 line-RLE decoder), page-header validation, the SPL2/QPDL record layout, the
 horizontal band placement, the Algo 0x11 RLE round trip, PJL field sanitisation,
-and every resource limit the filter enforces.
+job cancellation (SIGTERM before, between and in the middle of pages), and every
+resource limit the filter enforces.
 
 Several of them are pinned against measurements from real `cupsfilter` output
 rather than from the specification — `test_validate_page_header_accepts_real_cupsfilter_heights`
@@ -340,7 +341,7 @@ toolchain by hand:
 
 ```sh
 cargo build --release
-cupsfilter -p ppd/samsung-ml2165.ppd -m application/vnd.cups-raster -- doc.pdf > test.raster
+/usr/sbin/cupsfilter -p ppd/samsung-ml2165.ppd -m application/vnd.cups-raster -- doc.pdf > test.raster
 ./target/release/rastertospl-rust 101 testuser Test 1 "" test.raster > out.spl
 ```
 
@@ -352,6 +353,7 @@ A well-formed `out.spl` starts with `\x1b%-12345X@PJL`, contains
 - `src/main.rs` — CUPS filter entry point: argument parsing, page/band loop
 - `src/raster.rs` — CUPS Raster (V1/V2/V3) header parser
 - `src/spl.rs` — SPL2/QPDL protocol: PJL envelope, page/band records, Algo 0x11 RLE
+- `src/cancel.rs` — SIGTERM handling, so a cancelled job still ends with the closing UEL
 - `ppd/samsung-ml2165.ppd` — CUPS PPD file
 - `packaging/debian/` — `control`, `copyright` and `changelog` for the `.deb`
 

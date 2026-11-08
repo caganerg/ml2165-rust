@@ -1,3 +1,4 @@
+pub mod cancel;
 pub mod raster;
 pub mod spl;
 
@@ -5,6 +6,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use raster::{CupsColorOrder, CupsColorSpace, CupsRasterReader, PageHeader};
 use spl::{
@@ -91,6 +93,17 @@ fn main() {
 
     let args = CupsFilterArgs::parse(&raw_args);
 
+    // Girdi okunmaya başlanmadan, yani yazıcıya ilk bayt gitmeden kurulmalı;
+    // bkz. cancel.rs. Kurulamazsa iş yine basılır, yalnızca iptal eski
+    // davranışa (anında sonlanma) döner.
+    if let Err(err) = cancel::install_sigterm_handler() {
+        eprintln!(
+            "WARNING: SIGTERM işleyicisi kurulamadı ({}); iptal edilen bir iş yazıcıyı \
+             yarım bir QPDL akışıyla bırakabilir.",
+            err
+        );
+    }
+
     // `user`, `title` ve `job_id`, işi gönderen istemciden (CUPS üzerinden)
     // geldiği için güvenilmez kabul edilmeli: `{}` yerine `{:?}` (Debug)
     // kullanmak, gömülü ANSI/terminal kaçış dizilerini ve kontrol
@@ -135,7 +148,21 @@ fn main() {
     // uygulaması kapanış UEL'ini yazar. `process::exit` `Drop` çalıştırmadığı
     // için sıralama önemlidir — hata burada, writer çoktan düştükten sonra
     // raporlanır.
-    if let Err(err) = process_cups_raster_to_spl(&args, input_reader, io::stdout()) {
+    let result = process_cups_raster_to_spl(&args, input_reader, io::stdout(), &cancel::REQUESTED);
+    if let Err(err) = result {
+        // İptalde dönen hata her zaman `cancel::check`'in hatası olmayabilir:
+        // zincirdeki önceki filtre de SIGTERM alıp çıktığı için okuma bir
+        // bant sınırına varmadan EOF ile kesilebilir. Bayrak kalkmışsa hata
+        // iptalin sonucudur ve iş başarısız sayılmaz; CUPS'ın kendi
+        // filtreleri de (ör. `rastertoepson`) iptalde 0 ile çıkar.
+        if cancel::REQUESTED.load(Ordering::Relaxed) {
+            eprintln!(
+                "INFO: İş iptal edildi; kalan bantlar gönderilmedi ve akışın sonuna \
+                 kapanış UEL'i yazıldı (backend bağlantısı hâlâ açıksa) ({}).",
+                err
+            );
+            return;
+        }
         eprintln!("ERROR: Raster işleme hatası: {}", err);
         process::exit(1);
     }
@@ -749,10 +776,16 @@ fn sanitize_copies(num_copies: u32) -> u16 {
 /// `writer` parametre olarak alınır (doğrudan `io::stdout()` kullanılmaz) ki
 /// testler üretilen SPL akışını inceleyebilsin; özellikle hata yollarında
 /// kapanış UEL'inin yazıldığını doğrulamak için gerekli.
+///
+/// `cancel` aynı nedenle parametre: `main` süreç geneli SIGTERM bayrağını
+/// (`cancel::REQUESTED`) geçirir, testler kendi yerel bayraklarını. Bayrak her
+/// sayfa ve her bant başında okunur; kalkmışsa iş, diğer hatalarla aynı yoldan
+/// (`Drop` -> kapanış UEL'i) sonlanır.
 fn process_cups_raster_to_spl<W: Write>(
     args: &CupsFilterArgs,
     reader: Box<dyn Read>,
     writer: W,
+    cancel: &AtomicBool,
 ) -> io::Result<()> {
     // 1. CUPS Raster başlık/magic kontrolü (RaSt, RaS2, RaS3 vb.)
     let mut raster_reader = CupsRasterReader::new(reader)?;
@@ -807,6 +840,7 @@ fn process_cups_raster_to_spl<W: Write>(
 
     // 3. Sayfa Döngüsü
     while let Some(header) = next_header.take() {
+        cancel::check(cancel)?;
         validate_page_header(&header)?;
 
         // Kopya sayısı bir kez normalize edilir ve hem bütçeye hem yazıcıya
@@ -1010,6 +1044,7 @@ fn process_cups_raster_to_spl<W: Write>(
             band_width_u16,
             band_width_bytes,
             placement,
+            cancel,
         )?;
 
         // 3-Baytlık QPDL Sayfa Sonu
@@ -1050,6 +1085,7 @@ fn stream_page_bands<R: Read, W: Write>(
     band_width_pixels: u16,
     band_width_bytes: u32,
     placement: BandPlacement,
+    cancel: &AtomicBool,
 ) -> io::Result<()> {
     let cups_bytes_per_line = header.bytes_per_line as usize;
     let total_lines = header.height as usize;
@@ -1074,6 +1110,11 @@ fn stream_page_bands<R: Read, W: Write>(
     let mut current_line = 0;
 
     while current_line < total_lines {
+        // İptal bant SINIRINDA ele alınır: yarım bir bant kaydı hiçbir zaman
+        // yazılmaz. Bir bandı okuyup sıkıştırmak en büyük sayfada bile
+        // en kötü durumda (sıkıştırılamaz gürültü, ~6,65 MB/s) onlarca
+        // milisaniye sürdüğü için iptal gecikmesi önemsiz kalır.
+        cancel::check(cancel)?;
         let lines_in_this_band = (total_lines - current_line).min(band_height);
         band_data.fill(0);
 
@@ -1552,9 +1593,75 @@ mod tests {
 
     fn run_filter(stream: Vec<u8>) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(stream)), &mut out)
-            .expect("filtre geçerli akışı işleyemedi");
+        process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(stream)),
+            &mut out,
+            &not_cancelled(),
+        )
+        .expect("filtre geçerli akışı işleyemedi");
         out
+    }
+
+    /// Testlerin geçirdiği iptal bayrağı. Süreç geneli `cancel::REQUESTED`
+    /// kullanılmıyor, çünkü onu kaldıran bir test paralel çalışan diğer
+    /// testleri de iptal ederdi.
+    fn not_cancelled() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    /// Girdinin ilk `threshold` baytı okunduğunda iptal bayrağını kaldıran
+    /// okuyucu: SIGTERM'in işin TAM o noktasında gelmesini taklit eder.
+    struct CancelAfter {
+        inner: Cursor<Vec<u8>>,
+        threshold: u64,
+        flag: std::sync::Arc<AtomicBool>,
+    }
+
+    impl Read for CancelAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            if self.inner.position() >= self.threshold {
+                self.flag.store(true, Ordering::Relaxed);
+            }
+            Ok(n)
+        }
+    }
+
+    /// Filtreyi, girdinin ilk `threshold` baytından sonra iptal edilecek
+    /// şekilde çalıştırır; dönen hatayı ve üretilen akışı verir.
+    fn run_cancelled_after(stream: Vec<u8>, threshold: u64) -> (io::Error, Vec<u8>) {
+        let flag = std::sync::Arc::new(AtomicBool::new(threshold == 0));
+        let reader = CancelAfter {
+            inner: Cursor::new(stream),
+            threshold,
+            flag: flag.clone(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let err = process_cups_raster_to_spl(&no_args(), Box::new(reader), &mut out, &flag)
+            .expect_err("iptal edilen iş hata döndürmeliydi");
+        (err, out)
+    }
+
+    /// QPDL'ye geçişten sonraki İLK sayfanın şerit kayıtlarını sayar ve
+    /// kayıtlardan sonra kalan baytları döner. `parse_spl`'den farkı, sayfa
+    /// sonu kaydı olmayan (yarıda kesilmiş) bir sayfayı da kabul etmesidir.
+    fn split_first_page_bands(out: &[u8]) -> (usize, &[u8]) {
+        const QPDL_MARK: &[u8] = b"ENTER LANGUAGE = QPDL\n";
+        let mut pos = out
+            .windows(QPDL_MARK.len())
+            .position(|w| w == QPDL_MARK)
+            .expect("QPDL diline geçiş satırı yok")
+            + QPDL_MARK.len();
+        assert_eq!(out[pos], 0x00, "sayfa başlığı imzası beklendi");
+        pos += 17;
+        let mut bands = 0;
+        while out[pos] == 0x0C {
+            let total = u32::from_be_bytes(out[pos + 7..pos + 11].try_into().unwrap()) as usize;
+            pos += 11 + total;
+            bands += 1;
+        }
+        (bands, &out[pos..])
     }
 
     fn count_uel(stream: &[u8]) -> usize {
@@ -1572,8 +1679,13 @@ mod tests {
     fn test_closing_uel_written_on_truncated_page_data() {
         let stream = v3_stream(2); // 4 satır x 4 bayt = 16 bayt gerekiyordu
         let mut out: Vec<u8> = Vec::new();
-        let err = process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(stream)), &mut out)
-            .expect_err("kısa sayfa verisi hata döndürmeliydi");
+        let err = process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(stream)),
+            &mut out,
+            &not_cancelled(),
+        )
+        .expect_err("kısa sayfa verisi hata döndürmeliydi");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(
             out.ends_with(spl::PJL_END),
@@ -1590,8 +1702,13 @@ mod tests {
         stream[4 + 392..4 + 396].copy_from_slice(&0u32.to_be_bytes());
 
         let mut out: Vec<u8> = Vec::new();
-        let err = process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(stream)), &mut out)
-            .expect_err("geçersiz başlık hata döndürmeliydi");
+        let err = process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(stream)),
+            &mut out,
+            &not_cancelled(),
+        )
+        .expect_err("geçersiz başlık hata döndürmeliydi");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(out.ends_with(spl::PJL_END));
     }
@@ -1605,6 +1722,7 @@ mod tests {
             &no_args(),
             Box::new(Cursor::new(b"RaS3".to_vec())),
             &mut out,
+            &not_cancelled(),
         )
         .expect("sayfasız akış hata değil, uyarı üretmeli");
         assert!(out.ends_with(spl::PJL_END));
@@ -1616,11 +1734,71 @@ mod tests {
     #[test]
     fn test_successful_stream_has_exactly_one_uel_pair() {
         let mut out: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(v3_stream(16))), &mut out)
-            .expect("geçerli akış başarılı olmalı");
+        process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(v3_stream(16))),
+            &mut out,
+            &not_cancelled(),
+        )
+        .expect("geçerli akış başarılı olmalı");
         assert!(out.starts_with(spl::PJL_UEL));
         assert!(out.ends_with(spl::PJL_END));
         assert_eq!(count_uel(&out), 2, "fazladan UEL yazıldı");
+    }
+
+    /// İlk sayfadan önce iptal: iş açılmış olsa da hiçbir sayfa kaydı
+    /// yazılmamalı ve akış hemen kapanış UEL'i ile bitmeli.
+    #[test]
+    fn test_cancel_before_first_page_closes_job_without_pages() {
+        let stream = RasterSpec::a4(600, 600, 256).build();
+        let (err, out) = run_cancelled_after(stream, 0);
+        assert!(err.to_string().contains("iptal"), "{}", err);
+
+        const QPDL_MARK: &[u8] = b"ENTER LANGUAGE = QPDL\n";
+        let after_mark = out
+            .windows(QPDL_MARK.len())
+            .position(|w| w == QPDL_MARK)
+            .expect("QPDL diline geçiş satırı yok")
+            + QPDL_MARK.len();
+        assert_eq!(&out[after_mark..], spl::PJL_END);
+    }
+
+    /// Sayfa ortasında iptal, bant SINIRINDA ele alınmalı: o ana kadar
+    /// tamamlanmış bantlar yazılır, yarım bant ve sayfa sonu kaydı yazılmaz,
+    /// akış kapanış UEL'i ile biter.
+    #[test]
+    fn test_cancel_mid_page_stops_at_band_boundary() {
+        // 512 satır = 600 DPI'da 128'lik 4 bant.
+        let spec = RasterSpec::a4(600, 600, 512);
+        let bpl = spec.bytes_per_line() as u64;
+        // İptal 2. bandın ortasında (130. satır okunurken) gelir; 2. bant
+        // tamamlanır, 3. bandın başındaki kontrol işi durdurur.
+        let threshold = 4 + 1796 + 130 * bpl;
+        let (err, out) = run_cancelled_after(spec.build(), threshold);
+        assert!(err.to_string().contains("iptal"), "{}", err);
+
+        let (bands, rest) = split_first_page_bands(&out);
+        assert_eq!(bands, 2, "iptalden sonra bant yazılmamalıydı");
+        assert_eq!(rest, spl::PJL_END, "yarım sayfaya sayfa sonu kaydı eklendi");
+        assert_eq!(count_uel(&out), 2);
+    }
+
+    /// İki sayfa arasında iptal: tamamlanmış ilk sayfa olduğu gibi kalır
+    /// (sayfa sonu kaydıyla), ikinci sayfa hiç başlatılmaz.
+    #[test]
+    fn test_cancel_between_pages_keeps_completed_page() {
+        let mut spec = RasterSpec::a4(600, 600, 128);
+        spec.pages = 2;
+        let page_bytes = 1796 + 128 * spec.bytes_per_line() as u64;
+        // İlk sayfanın son baytı okunduğu anda iptal.
+        let (err, out) = run_cancelled_after(spec.build(), 4 + page_bytes);
+        assert!(err.to_string().contains("iptal"), "{}", err);
+
+        let pages = parse_spl(&out);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].bands.len(), 1);
+        assert!(out.ends_with(spl::PJL_END));
+        assert_eq!(count_uel(&out), 2);
     }
 
     /// Y-01 regresyonu (uçtan uca): sıkıştırılmış v2 akışı, aynı içeriğin
@@ -1669,11 +1847,21 @@ mod tests {
         v2.extend_from_slice(&[0x00, 0x03, 0xFF]); // 0xFF x4
 
         let mut out_v3: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(v3)), &mut out_v3)
-            .expect("v3 akışı işlenmeli");
+        process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(v3)),
+            &mut out_v3,
+            &not_cancelled(),
+        )
+        .expect("v3 akışı işlenmeli");
         let mut out_v2: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(&no_args(), Box::new(Cursor::new(v2)), &mut out_v2)
-            .expect("v2 akışı işlenmeli");
+        process_cups_raster_to_spl(
+            &no_args(),
+            Box::new(Cursor::new(v2)),
+            &mut out_v2,
+            &not_cancelled(),
+        )
+        .expect("v2 akışı işlenmeli");
 
         assert!(!out_v3.is_empty());
         assert_eq!(out_v2, out_v3, "v2 ve v3 çıktıları ayrıştı");
@@ -2195,6 +2383,7 @@ mod tests {
             &no_args(),
             Box::new(Cursor::new(v3_multipage_stream(MAX_PAGES_PER_JOB + 1))),
             &mut out,
+            &not_cancelled(),
         )
         .expect_err("sayfa sınırı aşılınca hata beklenir");
         assert!(err.to_string().contains("sayfa sınırını aştı"), "{}", err);
@@ -2302,6 +2491,7 @@ mod tests {
                 MAX_REALISTIC_COPIES as u32,
             ))),
             &mut out,
+            &not_cancelled(),
         )
         .expect_err("yaprak sınırı aşılınca hata beklenir");
         assert!(err.to_string().contains("yaprak sınırını aştı"), "{}", err);
@@ -2437,6 +2627,7 @@ mod tests {
             &no_args(),
             Box::new(Cursor::new(v3_multipage_stream(MAX_PAGES_PER_JOB))),
             &mut out,
+            &not_cancelled(),
         )
         .expect("tam sınır kadar sayfa kabul edilmeli");
         assert!(out.ends_with(spl::PJL_END));
