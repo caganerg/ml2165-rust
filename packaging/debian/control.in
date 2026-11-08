@@ -1,8 +1,8 @@
 Package: ml2165-rust
-Version: 1.1.0-1
+Version: @VERSION@
 Section: utils
 Priority: optional
-Architecture: amd64
+Architecture: @ARCH@
 Depends: cups (>= 2.4), cups-filters, libc6 (>= 2.34), libgcc-s1 (>= 4.2)
 Maintainer: CUPS Raster Filter Developer <caganergun@tutanota.com>
 Homepage: https://github.com/caganerg/ml2165-rust

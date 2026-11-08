@@ -24,7 +24,8 @@ model.
   `rust-version`, so an older `cargo` refuses to build. The installed package
   itself still runs on Debian 13; only building it there is unsupported.
 - CUPS (`lpadmin`, `lpinfo`, `cupstestppd`)
-- `ar`, `tar`, `xz` and `gzip` to build the package — `dpkg-dev` is not needed
+- `dpkg-deb`, `readelf` and `gzip` to build the package — all part of a standard
+  Debian install (`dpkg`, `binutils`, `gzip`); `dpkg-dev` is not needed
 - Printer powered on and attached over USB
 
 ## Installation
@@ -36,9 +37,11 @@ back out with `apt remove`. The target platforms are Debian 13 (trixie) and
 Debian 14. On anything else — or when working on the filter itself — use
 [Manual installation](#manual-installation) further down instead.
 
-There is no install script: the steps below *are* the procedure. Run them from
-the repository root as your normal user. Only the `sudo` lines write to system
-paths, so **don't run the whole sequence as root**.
+There is no install script: the steps below *are* the procedure. (The build
+script in step 2 only writes files under `target/` and `dist/`; installing is
+always your own `sudo apt install`.) Run them from the repository root as your
+normal user. Only the `sudo` lines write to system paths, so **don't run the
+whole sequence as root**.
 
 ### 1. Check that the repository path is under your control
 
@@ -65,82 +68,61 @@ installed as a root-owned CUPS filter.
 
 ### 2. Build the package
 
-The filter is an ordinary **glibc** build — it uses no third-party crates, so
-the only things it links against are the C runtime and `libgcc_s`. That is what
-the declared dependencies say: `cups`, `cups-filters`, `libc6 (>= 2.34)` and
-`libgcc-s1 (>= 4.2)`. Both Debian releases ship a glibc newer than that, so a
-package built on Debian 13 installs unchanged on Debian 14.
-
-A `.deb` is an `ar` archive of three members, and `ar`, `tar`, `xz` and `gzip`
-are enough to produce one. The control metadata lives in `packaging/debian/`
-and its `Version:` field is what the file name below has to match.
-
 ```sh
-cargo build --release
-
-REPO=$PWD
-VERSION=1.1.0-1
-DOC=usr/share/doc/ml2165-rust
-BUILD=$(mktemp -d)
-mkdir -p "$BUILD"/root/usr/lib/cups/filter \
-         "$BUILD"/root/usr/share/ppd/ml2165-rust \
-         "$BUILD"/root/"$DOC" "$BUILD"/control
-
-install -m 755 target/release/rastertospl-rust \
-    "$BUILD/root/usr/lib/cups/filter/rastertospl-rust"
-install -m 644 ppd/samsung-ml2165.ppd \
-    "$BUILD/root/usr/share/ppd/ml2165-rust/samsung-ml2165.ppd"
-install -m 644 packaging/debian/copyright "$BUILD/root/$DOC/copyright"
-gzip -9nc packaging/debian/changelog > "$BUILD/root/$DOC/changelog.Debian.gz"
-gzip -9nc README.md > "$BUILD/root/$DOC/README.md.gz"
-chmod 644 "$BUILD"/root/"$DOC"/*.gz
-
-awk -v s="$(du -sk --apparent-size "$BUILD/root" | cut -f1)" \
-    '/^Description:/ && !d { print "Installed-Size: " s; d = 1 } { print }' \
-    packaging/debian/control > "$BUILD/control/control"
-( cd "$BUILD/root" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs md5sum ) \
-    > "$BUILD/control/md5sums"
-chmod 644 "$BUILD/control/control" "$BUILD/control/md5sums"
-
-printf '2.0\n' > "$BUILD/debian-binary"
-TARFLAGS="--owner=root --group=root --numeric-owner --sort=name --mtime=@0 --mode=go-w"
-tar $TARFLAGS -C "$BUILD/root"    -cf - . | xz -9e > "$BUILD/data.tar.xz"
-tar $TARFLAGS -C "$BUILD/control" -cf - . | xz -9e > "$BUILD/control.tar.xz"
-
-mkdir -p "$REPO/dist"
-( cd "$BUILD" && ar rcD "$REPO/dist/ml2165-rust_${VERSION}_amd64.deb" \
-    debian-binary control.tar.xz data.tar.xz )
+packaging/build-deb.sh            # amd64; writes dist/ml2165-rust_<version>_amd64.deb
 ```
 
-The `--owner=root --group=root --numeric-owner` flags are not cosmetic: they are
-what makes the installed filter root-owned regardless of who built the package.
-`--mode=go-w` is there for the same reason — without it the directories inherit
-the build user's umask, and a `.deb` built under a 002 umask would install
-group-writable directories under `/usr/lib/cups/filter` and `/usr/share/ppd`.
+The script runs the tests, builds the release binary and packages it with
+`dpkg-deb`. Read it before running it — it is short, and the package it
+produces is installed as root in step 3. It refuses to build when:
 
-Check the result before installing it:
+- `Cargo.toml` or the PPD's `*FileVersion` disagree with the version on the
+  first line of `packaging/debian/changelog`, which is the one place the
+  version is set;
+- the binary needs a newer glibc or `libgcc_s` than
+  `packaging/debian/control.in` declares (currently `libc6 (>= 2.34)` and
+  `libgcc-s1 (>= 4.2)`), which would let the package install on a system
+  where the filter cannot run.
+
+The filter is an ordinary **glibc** build with no third-party crates, so the C
+runtime and `libgcc_s` are all it links against. Both Debian 13 and 14 ship a
+newer glibc than it needs, so a package built here installs on either.
+
+Ownership is forced to `root:root` and permissions to `755`/`644` whatever the
+build user's umask, and every timestamp is the date of the last commit: the
+same commit and toolchain give a byte-identical `.deb`. The script prints the
+package metadata, its file listing and its SHA-256 at the end; everything in
+the listing must be `root/root`, the filter `755` and the data files `644`.
+
+#### Building for arm64
+
+The same script cross-compiles an arm64 package on an amd64 machine; the code
+has no architecture-specific paths. It needs Debian's arm64 Rust standard
+library, which matches Debian's `rustc` exactly (the official Rust tarballs do
+not work with it), and the cross linker:
 
 ```sh
-dpkg-deb -I dist/ml2165-rust_1.1.0-1_amd64.deb    # control metadata
-dpkg-deb -c dist/ml2165-rust_1.1.0-1_amd64.deb    # paths, owners, modes
+sudo dpkg --add-architecture arm64
+sudo apt update
+sudo apt install libstd-rust-dev:arm64 gcc-aarch64-linux-gnu
+packaging/build-deb.sh arm64      # writes dist/ml2165-rust_<version>_arm64.deb
 ```
 
-Everything in the listing must be `root/root`, the filter `755` and the data
-files `644`.
-
-If you extend the filter, re-derive the two library versions in
-`packaging/debian/control` from the binary you are about to ship rather than
-trusting the numbers there:
+The script's own test run happens on the build machine. To run the tests on
+arm64 as well, install `qemu-user` and:
 
 ```sh
-objdump -T target/release/rastertospl-rust | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
-objdump -T target/release/rastertospl-rust | grep -o 'GCC_[0-9.]*'   | sort -uV | tail -1
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu" \
+    cargo test --release --target aarch64-unknown-linux-gnu
 ```
+
+Copy the `.deb` to the arm64 machine and install it there as in step 3.
 
 ### 3. Install the package
 
 ```sh
-sudo apt install ./dist/ml2165-rust_1.1.0-1_amd64.deb
+sudo apt install ./dist/ml2165-rust_1.2.0-1_amd64.deb
 ```
 
 Use `apt install ./…` rather than `dpkg -i` so that `cups` and `cups-filters`
@@ -359,7 +341,9 @@ A well-formed `out.spl` starts with `\x1b%-12345X@PJL`, contains
 - `src/spl.rs` — SPL2/QPDL protocol: PJL envelope, page/band records, Algo 0x11 RLE
 - `src/cancel.rs` — SIGTERM handling, so a cancelled job still ends with the closing UEL
 - `ppd/samsung-ml2165.ppd` — CUPS PPD file
-- `packaging/debian/` — `control`, `copyright` and `changelog` for the `.deb`
+- `packaging/build-deb.sh` — builds the `.deb` (see [Build the package](#2-build-the-package))
+- `packaging/debian/` — `control.in` (template), `copyright` and `changelog`; the
+  changelog's first line sets the package version
 
 ## License
 

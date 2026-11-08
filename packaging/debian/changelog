@@ -1,3 +1,27 @@
+ml2165-rust (1.2.0-1) stable; urgency=medium
+
+  * Close the QPDL stream with the closing UEL when a job is cancelled:
+    the filter now handles SIGTERM, stops at the next band boundary and
+    exits 0, instead of being killed mid-band and leaving the printer in
+    QPDL mode.
+  * Drop the per-job limits (1000 pages, 8 GiB of raster, 10000 sheets);
+    long documents now print. Copies are still capped at 999 per page, and
+    CUPS' own job-page-limit is the place for quotas.
+  * Remove the unreachable manual-duplex path. The PPD never offered duplex,
+    so jobs were and remain single-sided (DUPLEX=OFF).
+  * Non-ASCII characters in the PJL job and user names are now dropped
+    instead of folded to ASCII; the ML-2165 does not display either field.
+  * The data sent to the printer is otherwise unchanged for every supported
+    paper size, resolution, paper type and tray.
+  * Build with rustc 1.97.1 or newer, and produce the package with
+    packaging/build-deb.sh (dpkg-deb) instead of assembling it by hand.
+    Packages are reproducible: the same commit gives byte-identical .debs.
+  * Also build for arm64, cross-compiled on amd64. The test suite passes
+    under qemu-user and the data sent to the printer is byte-identical to
+    the amd64 build.
+
+ -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Sun, 08 Nov 2026 20:28:48 +0300
+
 ml2165-rust (1.1.0-1) stable; urgency=medium
 
   * Narrow the driver to the USB-attached Samsung ML-2165: the ML-2160,

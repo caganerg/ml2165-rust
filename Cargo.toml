@@ -1,6 +1,6 @@
 [package]
 name = "ml2165-rust"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 # The .deb is built on the maintainer's Debian 14 machine with its packaged
 # rustc; building on Debian 13 (rustc 1.85) is not a goal. The resulting
