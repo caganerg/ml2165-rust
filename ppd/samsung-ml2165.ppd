@@ -175,13 +175,4 @@
 *MediaType ARCHIVE/Archive: "<</MediaType(ARCHIVE)>>setpagedevice"
 *CloseUI: *MediaType
 
-*% ============================================================================
-*% SPL2 Driver Attributes
-*% ============================================================================
-*QPDL QPDLVersion: "3"
-*QPDL BandSize: "128"
-*QPDL ManualDuplex: "On"
-*QPDL PacketSize: "512"
-*General DocHeaderValues: "<0><0><1>"
-
 *% End of ML2165.PPD
