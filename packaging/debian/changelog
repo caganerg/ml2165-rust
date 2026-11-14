@@ -1,3 +1,19 @@
+ml2165-rust (1.2.1-1) stable; urgency=low
+
+  * Remove the SpliX driver attributes from the PPD (*QPDL QPDLVersion,
+    BandSize, ManualDuplex, PacketSize and *General DocHeaderValues).
+    This filter never read them, and ManualDuplex "On" contradicted the
+    removal of duplex in 1.2.0.
+  * A raster header whose line width, height or page size is out of range
+    is rejected exactly as before, but the ERROR line in the CUPS log now
+    names the page it does not fit ("... sayfa genişliğine sığmıyor: 595 pt
+    @ 600 DPI ...") instead of a fixed limit.
+  * Internal simplification of the filter. The data sent to the printer is
+    unchanged for every supported paper size, resolution, paper type and
+    tray.
+
+ -- CUPS Raster Filter Developer <caganergun@tutanota.com>  Sat, 14 Nov 2026 14:39:56 +0300
+
 ml2165-rust (1.2.0-1) stable; urgency=medium
 
   * Close the QPDL stream with the closing UEL when a job is cancelled:

@@ -122,7 +122,7 @@ Copy the `.deb` to the arm64 machine and install it there as in step 3.
 ### 3. Install the package
 
 ```sh
-sudo apt install ./dist/ml2165-rust_1.2.0-1_amd64.deb
+sudo apt install ./dist/ml2165-rust_1.2.1-1_amd64.deb
 ```
 
 Use `apt install ./…` rather than `dpkg -i` so that `cups` and `cups-filters`
