@@ -659,9 +659,9 @@ mod tests {
     }
 
     /// QPDL bant sırası alanı 8 bitliktir; 257. bant sessizce 0'a sarmak
-    /// yerine hata vermeli. Bugün erişilemez (en kötü durum 170 bant), ama
-    /// invaryant `MAX_POINTS`/`QPDL_BAND_HEIGHT` değiştiğinde bozulmasın diye
-    /// pinleniyor.
+    /// yerine hata vermeli. Bugün erişilemez (en kötü durum, Legal @1200 DPI,
+    /// 132 bant), ama invaryant kâğıt tablosu ya da `QPDL_BAND_HEIGHT`
+    /// değiştiğinde bozulmasın diye pinleniyor.
     #[test]
     fn test_band_index_beyond_255_is_rejected_not_wrapped() {
         let mut out: Vec<u8> = Vec::new();

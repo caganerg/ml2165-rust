@@ -147,13 +147,6 @@ fn quote_untrusted(value: &str) -> String {
     format!("{:?}", value)
 }
 
-/// En büyük `*PaperDimension` (Legal: 1008 pt) + makul pay.
-const MAX_POINTS: u32 = 1300;
-/// ~1300 pt * 1200 dpi / 72 / 8 ≈ 2709 B (1-bit); yuvarlanıp pay bırakıldı.
-const MAX_BYTES_PER_LINE: u32 = 4096;
-/// ~1300 pt * 1200 dpi / 72 ≈ 21.667 satır; yuvarlanıp pay bırakıldı.
-const MAX_LINES: u32 = 24_000;
-
 /// Fiziksel sayfa genişliğinin üzerinde kabul edilen yuvarlama payı (bayt).
 const LINE_OVERSHOOT_SLACK_BYTES: u32 = 1;
 
@@ -175,19 +168,25 @@ struct PageGeometry {
 ///
 /// Başlık alanları doğrudan tampon boyutlarını ve QPDL sayfa başlığını
 /// belirler; bozuk bir başlık devasa tahsislere ya da yazıcıya bildirilen
-/// geometriyle gönderilen verinin ayrışmasına yol açardı. Sınırlar PPD'nin en
-/// yüksek çözünürlüğünden ve en büyük kağıdından türetildi; bağı
-/// `test_limits_cover_every_ppd_option` denetler.
+/// geometriyle gönderilen verinin ayrışmasına yol açardı.
+///
+/// Ayrı bir üst sınır sabiti yoktur: çözünürlük ve kâğıt ölçüsü yalnızca
+/// PPD'nin sunduğu değerler olabilir, satır genişliği ve yüksekliği de o
+/// kâğıdın fiziksel boyutuna sığmak zorundadır. En büyük kabul edilen sayfa
+/// Legal @1200 DPI'dır: yatayda 2101 bayt/satır, dikeyde 16808 satır. Bunların
+/// QPDL kayıtlarının alanlarına sığdığını `test_limits_cover_every_ppd_option`
+/// denetler.
 fn validate_page_header(header: &PageHeader) -> io::Result<PageGeometry> {
     let invalid = |msg: String| Err(io::Error::new(io::ErrorKind::InvalidData, msg));
 
-    if header.bytes_per_line == 0 || header.bytes_per_line > MAX_BYTES_PER_LINE {
+    // Üst sınırlar aşağıda, sayfanın fiziksel boyutuna karşı denetlenir.
+    if header.bytes_per_line == 0 {
         return invalid(format!(
             "Geçersiz cupsBytesPerLine değeri: {}",
             header.bytes_per_line
         ));
     }
-    if header.height == 0 || header.height > MAX_LINES {
+    if header.height == 0 {
         return invalid(format!(
             "Geçersiz sayfa yüksekliği (satır sayısı): {}",
             header.height
@@ -201,16 +200,6 @@ fn validate_page_header(header: &PageHeader) -> io::Result<PageGeometry> {
             header.hw_resolution[0], header.hw_resolution[1]
         ));
     };
-    if header
-        .page_size_points
-        .iter()
-        .any(|&pt| pt == 0 || pt > MAX_POINTS)
-    {
-        return invalid(format!(
-            "Geçersiz sayfa boyutu (pt): {:?}",
-            header.page_size_points
-        ));
-    }
     let Some(paper_size) = SplPaperSize::from_dimensions_pt_exact(
         header.page_size_points[0],
         header.page_size_points[1],
@@ -223,8 +212,8 @@ fn validate_page_header(header: &PageHeader) -> io::Result<PageGeometry> {
 
     // Sol kenar boşluğu yatay yerleşimi belirler (bkz. `band_placement`).
     // Sayfadan geniş bir değer anlamsızdır ve `hard_margin_bytes`taki
-    // toplamayı taşırabilirdi; sayfa genişliği yukarıda sınırlandığı için bu
-    // kontrol taşmayı da kapatır. PPD'deki değer 12,5 pt'dir, CUPS onu 12'ye
+    // toplamayı taşırabilirdi; sayfa genişliği yukarıda kâğıt tablosuyla
+    // sınırlandığı için bu kontrol taşmayı da kapatır. PPD'deki değer 12,5 pt'dir, CUPS onu 12'ye
     // kırpar.
     if header.margins[0] >= header.page_size_points[0] {
         return invalid(format!(
@@ -741,10 +730,6 @@ mod tests {
     use super::*;
     use raster::CupsRasterVersion;
     use std::io::Cursor;
-
-    /// PPD'deki en yüksek `*Resolution` seçeneği; `MAX_BYTES_PER_LINE` ve
-    /// `MAX_LINES` bu değerden türetildi.
-    const MAX_DPI: u32 = 1200;
 
     /// Projenin PPD dosyasını okur. Aşağıdaki testlerin bir bölümü, filtrenin
     /// sabitlerini PPD'nin gerçek içeriğine bağlar: PPD'ye yeni bir seçenek
@@ -1306,13 +1291,15 @@ mod tests {
         assert_eq!(out_v2, out_v3, "v2 ve v3 çıktıları ayrıştı");
     }
 
-    /// `validate_page_header` sınırları, PPD'nin sunduğu HER seçeneği
-    /// kapsamalı.
+    /// PPD'nin sunduğu HER kağıt ve çözünürlük, QPDL kayıtlarının alanlarına
+    /// sığmalı.
     ///
-    /// Sabitler PPD'den elle türetilmişti ve aradaki bağ yalnızca bir
-    /// yorumdu: PPD'ye daha büyük bir kağıt ya da daha yüksek bir çözünürlük
-    /// eklenirse, sabitleri güncellemeyi unutmak meşru işlerin sessizce
-    /// reddedilmesine yol açardı. Bu test o bağı zorunlu kılar.
+    /// `validate_page_header` satır genişliğini ve yüksekliğini kâğıdın
+    /// fiziksel boyutuyla sınırlar; QPDL ise genişliği ve yüksekliği 16 bitlik,
+    /// bant sırasını 8 bitlik alanlarda taşır. PPD'ye daha büyük bir kağıt ya
+    /// da daha yüksek bir çözünürlük eklenirse doğrulamadan geçen meşru bir iş
+    /// bu alanlara sığmayıp çalışma anında reddedilirdi. Bu test o bağı
+    /// zorunlu kılar.
     #[test]
     fn test_limits_cover_every_ppd_option() {
         for (x_dpi, y_dpi) in ppd_resolutions() {
@@ -1322,44 +1309,43 @@ mod tests {
                 x_dpi,
                 y_dpi
             );
-            for dpi in [x_dpi, y_dpi] {
-                assert!(
-                    dpi <= MAX_DPI,
-                    "PPD {} DPI sunuyor ama MAX_DPI = {}; sabiti güncelleyin",
-                    dpi,
-                    MAX_DPI
-                );
-            }
-        }
+            let mut header = valid_header();
+            header.hw_resolution = [x_dpi, y_dpi];
+            let band_height = band_height_for(&header) as u32;
 
-        for (name, w, h) in ppd_paper_dimensions() {
-            for pt in [w, h] {
-                assert!(
-                    pt <= MAX_POINTS,
-                    "PPD '{}' {} pt kağıt sunuyor ama MAX_POINTS = {}; sabiti güncelleyin",
-                    name,
-                    pt,
-                    MAX_POINTS
-                );
-                // En büyük kağıt en yüksek çözünürlükte satır/sütun
-                // sınırlarına da sığmalı.
-                let pixels = (pt as u64 * MAX_DPI as u64).div_ceil(72);
-                assert!(
-                    pixels <= MAX_LINES as u64,
-                    "{} pt @ {} DPI = {} satır, MAX_LINES = {}",
-                    pt,
-                    MAX_DPI,
-                    pixels,
-                    MAX_LINES
-                );
-                assert!(
-                    pixels.div_ceil(8) <= MAX_BYTES_PER_LINE as u64,
-                    "{} pt @ {} DPI = {} bayt/satır, MAX_BYTES_PER_LINE = {}",
-                    pt,
-                    MAX_DPI,
-                    pixels.div_ceil(8),
-                    MAX_BYTES_PER_LINE
-                );
+            for (name, w, h) in ppd_paper_dimensions() {
+                // Dikey ve yatay (genişlik/yükseklik yer değiştirmiş) sayfa.
+                for (width_pt, height_pt) in [(w, h), (h, w)] {
+                    let what = format!(
+                        "PPD '{}' {}x{} pt @ {}x{} DPI",
+                        name, width_pt, height_pt, x_dpi, y_dpi
+                    );
+
+                    let width_px = compute_page_width_pixels(width_pt, x_dpi);
+                    assert!(
+                        u16::try_from(width_px).is_ok(),
+                        "{}: bant genişliği {} px, 16-bit alana sığmıyor",
+                        what,
+                        width_px
+                    );
+
+                    // Doğrulamanın kabul ettiği en uzun sayfa.
+                    let max_lines =
+                        points_to_pixels(height_pt, y_dpi) + HEIGHT_OVERSHOOT_SLACK_LINES;
+                    assert!(
+                        u16::try_from(max_lines).is_ok(),
+                        "{}: {} satır, 16-bit alana sığmıyor",
+                        what,
+                        max_lines
+                    );
+                    let bands = max_lines.div_ceil(band_height);
+                    assert!(
+                        bands <= 256,
+                        "{}: {} bant, 8-bit bant sırasına sığmıyor",
+                        what,
+                        bands
+                    );
+                }
             }
         }
     }
@@ -1415,7 +1401,7 @@ mod tests {
     fn test_validate_page_header_rejects_page_taller_than_paper() {
         let mut header = valid_header();
         header.page_size_points = [297, 420]; // desteklenen A6
-        header.height = 4_000; // MAX_LINES içinde, ama A6'ya sığmıyor
+        header.height = 4_000; // A4'e sığardı, ama A6'ya sığmıyor
         let err = validate_page_header(&header).expect_err("uzun sayfa reddedilmeliydi");
         assert!(
             err.to_string().contains("sayfa yüksekliğine sığmıyor"),
