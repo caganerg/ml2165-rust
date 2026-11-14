@@ -1,6 +1,6 @@
-pub mod cancel;
-pub mod raster;
-pub mod spl;
+mod cancel;
+mod raster;
+mod spl;
 
 use std::env;
 use std::fs::File;
@@ -147,14 +147,12 @@ fn quote_untrusted(value: &str) -> String {
     format!("{:?}", value)
 }
 
-/// PPD'deki en yüksek `*Resolution` seçeneği.
-pub const MAX_DPI: u32 = 1200;
 /// En büyük `*PaperDimension` (Legal: 1008 pt) + makul pay.
-pub const MAX_POINTS: u32 = 1300;
+const MAX_POINTS: u32 = 1300;
 /// ~1300 pt * 1200 dpi / 72 / 8 ≈ 2709 B (1-bit); yuvarlanıp pay bırakıldı.
-pub const MAX_BYTES_PER_LINE: u32 = 4096;
+const MAX_BYTES_PER_LINE: u32 = 4096;
 /// ~1300 pt * 1200 dpi / 72 ≈ 21.667 satır; yuvarlanıp pay bırakıldı.
-pub const MAX_LINES: u32 = 24_000;
+const MAX_LINES: u32 = 24_000;
 
 /// Fiziksel sayfa genişliğinin üzerinde kabul edilen yuvarlama payı (bayt).
 const LINE_OVERSHOOT_SLACK_BYTES: u32 = 1;
@@ -162,15 +160,25 @@ const LINE_OVERSHOOT_SLACK_BYTES: u32 = 1;
 /// Fiziksel sayfa yüksekliğinin üzerinde kabul edilen yuvarlama payı (satır).
 const HEIGHT_OVERSHOOT_SLACK_LINES: u32 = 8;
 
+/// Doğrulanmış bir sayfa başlığının QPDL karşılıkları. Yalnızca
+/// `validate_page_header` üretir: kağıt kodu ve çözünürlük, doğrulamadan
+/// geçmemiş bir başlıktan türetilemez ve ikisi birbirinden ayrışamaz.
+#[derive(Debug)]
+struct PageGeometry {
+    paper_size: SplPaperSize,
+    resolution_x: SplResolution,
+    resolution_y: SplResolution,
+}
+
 /// Sayfa başlığını, bu filtrenin ve yazıcının kabul edebileceği geometriye
-/// karşı doğrular.
+/// karşı doğrular ve QPDL karşılıklarını döndürür.
 ///
 /// Başlık alanları doğrudan tampon boyutlarını ve QPDL sayfa başlığını
 /// belirler; bozuk bir başlık devasa tahsislere ya da yazıcıya bildirilen
 /// geometriyle gönderilen verinin ayrışmasına yol açardı. Sınırlar PPD'nin en
 /// yüksek çözünürlüğünden ve en büyük kağıdından türetildi; bağı
 /// `test_limits_cover_every_ppd_option` denetler.
-fn validate_page_header(header: &PageHeader) -> io::Result<()> {
+fn validate_page_header(header: &PageHeader) -> io::Result<PageGeometry> {
     let invalid = |msg: String| Err(io::Error::new(io::ErrorKind::InvalidData, msg));
 
     if header.bytes_per_line == 0 || header.bytes_per_line > MAX_BYTES_PER_LINE {
@@ -185,33 +193,33 @@ fn validate_page_header(header: &PageHeader) -> io::Result<()> {
             header.height
         ));
     }
-    if !SplResolution::pair_is_supported(header.hw_resolution[0], header.hw_resolution[1]) {
+    let Some((resolution_x, resolution_y)) =
+        SplResolution::from_dpi_pair(header.hw_resolution[0], header.hw_resolution[1])
+    else {
         return invalid(format!(
             "Desteklenmeyen çözünürlük: {}x{} DPI (desteklenenler: 300x300, 600x600, 1200x600, 1200x1200)",
             header.hw_resolution[0], header.hw_resolution[1]
         ));
-    }
-    if header.page_size_points[0] == 0
-        || header.page_size_points[0] > MAX_POINTS
-        || header.page_size_points[1] == 0
-        || header.page_size_points[1] > MAX_POINTS
+    };
+    if header
+        .page_size_points
+        .iter()
+        .any(|&pt| pt == 0 || pt > MAX_POINTS)
     {
         return invalid(format!(
             "Geçersiz sayfa boyutu (pt): {:?}",
             header.page_size_points
         ));
     }
-    if SplPaperSize::from_dimensions_pt_exact(
+    let Some(paper_size) = SplPaperSize::from_dimensions_pt_exact(
         header.page_size_points[0],
         header.page_size_points[1],
-    )
-    .is_none()
-    {
+    ) else {
         return invalid(format!(
             "Desteklenmeyen kâğıt ölçüsü: {} x {} pt; QPDL kâğıt kodu ile raster geometrisinin uyuşması gerekir",
             header.page_size_points[0], header.page_size_points[1]
         ));
-    }
+    };
 
     // Sol kenar boşluğu yatay yerleşimi belirler (bkz. `band_placement`).
     // Sayfadan geniş bir değer anlamsızdır ve `hard_margin_bytes`taki
@@ -240,8 +248,9 @@ fn validate_page_header(header: &PageHeader) -> io::Result<()> {
             header.bits_per_color, header.bits_per_pixel
         ));
     }
-    let expected_bytes_per_line = (header.width as u64 * header.bits_per_pixel as u64).div_ceil(8);
-    if expected_bytes_per_line != header.bytes_per_line as u64 {
+    // Piksel 1 bit olduğuna göre satır `ceil(cupsWidth / 8)` bayttır.
+    let expected_bytes_per_line = header.width.div_ceil(8);
+    if expected_bytes_per_line != header.bytes_per_line {
         return invalid(format!(
             "cupsBytesPerLine ({}) cupsWidth ({}) ile tutarsız (beklenen: {})",
             header.bytes_per_line, header.width, expected_bytes_per_line
@@ -276,12 +285,12 @@ fn validate_page_header(header: &PageHeader) -> io::Result<()> {
     }
 
     // Aynı kural dikeyde: aksi hâlde yazıcıya sayfaya sığandan çok daha fazla
-    // satır bildirilip gönderilebilirdi. Dikeyde hizalama olmadığı için pay
-    // 8 satırdır. Gerçek çıktı bu sınırın çok altındadır, çünkü PPD'nin
-    // `*ImageableArea` kenar boşlukları düşer: A4 @600 DPI'da fiziksel 7017
-    // satıra karşılık ölçülen `cupsHeight` ~6817'dir.
-    let page_height_lines =
-        compute_page_height_lines(header.page_size_points[1], header.hw_resolution[1]);
+    // satır bildirilip gönderilebilirdi. Sayfanın fiziksel yüksekliği dikey
+    // çözünürlükle hesaplanır (PPD `1200x600dpi` sunar) ve 8'e hizalanmaz; pay
+    // bu yüzden 8 satırdır. Gerçek çıktı bu sınırın çok altındadır, çünkü
+    // PPD'nin `*ImageableArea` kenar boşlukları düşer: A4 @600 DPI'da fiziksel
+    // 7017 satıra karşılık ölçülen `cupsHeight` ~6817'dir.
+    let page_height_lines = points_to_pixels(header.page_size_points[1], header.hw_resolution[1]);
     if header.height > page_height_lines + HEIGHT_OVERSHOOT_SLACK_LINES {
         return invalid(format!(
             "cupsHeight ({}) sayfa yüksekliğine sığmıyor: {} pt @ {} DPI => en fazla {} satır",
@@ -289,22 +298,23 @@ fn validate_page_header(header: &PageHeader) -> io::Result<()> {
         ));
     }
 
-    Ok(())
+    Ok(PageGeometry {
+        paper_size,
+        resolution_x,
+        resolution_y,
+    })
+}
+
+/// Punto cinsinden bir uzunluğun verilen çözünürlükteki piksel karşılığı,
+/// yukarı yuvarlanmış (SpliX `ceil(convertToXResolution(pt))`).
+fn points_to_pixels(pt: u32, dpi: u32) -> u32 {
+    (pt as f64 * dpi as f64 / 72.0).ceil() as u32
 }
 
 /// SpliX document.cpp `pageWidth`:
 /// `((unsigned long)ceil(convertToXResolution(pageWidth)) + 7) & ~7`
 fn compute_page_width_pixels(page_size_pt: u32, x_dpi: u32) -> u32 {
-    let px = (page_size_pt as f64 * x_dpi as f64 / 72.0).ceil() as u32;
-    (px + 7) & !7u32
-}
-
-/// Sayfanın fiziksel yüksekliği, raster satırı olarak. Genişlikten farklı
-/// olarak 8'e hizalanmaz ve dikey çözünürlüğü kullanır (PPD `1200x600dpi`
-/// sunar). Yalnızca `validate_page_header`'da üst sınır olarak kullanılır;
-/// gönderilen satır sayısını `cupsHeight` belirler.
-fn compute_page_height_lines(page_size_pt: u32, y_dpi: u32) -> u32 {
-    (page_size_pt as f64 * y_dpi as f64 / 72.0).ceil() as u32
+    (points_to_pixels(page_size_pt, x_dpi) + 7) & !7
 }
 
 /// Yazıcının sert kenar boşluğu, bant tamponu baytı olarak (SpliX
@@ -320,8 +330,7 @@ fn compute_page_height_lines(page_size_pt: u32, y_dpi: u32) -> u32 {
 /// tarafından 12'ye kırpılmış). 8'e hizalama şarttır: 12 pt @600 DPI = 100
 /// piksel -> 104 piksel = 13 bayt; bant tamponu bayt adreslidir.
 fn hard_margin_bytes(margin_pt: u32, x_dpi: u32) -> usize {
-    let px = (margin_pt as f64 * x_dpi as f64 / 72.0).ceil() as u32;
-    (((px + 7) & !7u32) / 8) as usize
+    (((points_to_pixels(margin_pt, x_dpi) + 7) & !7) / 8) as usize
 }
 
 /// CUPS satırının bant tamponundaki yatay yerleşimi. İki alan birlikte tek
@@ -399,7 +408,7 @@ fn pjl_paper_type_for(header: &PageHeader) -> &'static str {
 
 /// QPDL şerit yüksekliğinin temel değeri (SpliX PPD'lerindeki
 /// `*QPDL BandSize: "128"`).
-pub const QPDL_BAND_HEIGHT: usize = 128;
+const QPDL_BAND_HEIGHT: usize = 128;
 
 /// Bir sayfa için şerit yüksekliği. SpliX compress.cpp `_compressBandedPage`:
 ///
@@ -438,9 +447,9 @@ fn sanitize_copies(num_copies: u32) -> u16 {
 /// geneli SIGTERM bayrağını (`cancel::REQUESTED`) geçirir. Bayrak her sayfa
 /// ve her bant başında okunur; kalkmışsa iş, diğer hatalarla aynı yoldan
 /// (`Drop` -> kapanış UEL'i) sonlanır.
-fn process_cups_raster_to_spl<W: Write>(
+fn process_cups_raster_to_spl<R: Read, W: Write>(
     args: &CupsFilterArgs,
-    reader: Box<dyn Read>,
+    reader: R,
     writer: W,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
@@ -479,7 +488,7 @@ fn process_cups_raster_to_spl<W: Write>(
 
     while let Some(header) = next_header.take() {
         cancel::check(cancel)?;
-        validate_page_header(&header)?;
+        let geometry = validate_page_header(&header)?;
         page_number += 1;
 
         // Kopya sayısı bir kez normalize edilir; log, sayfa başlığı ve sayfa
@@ -554,20 +563,6 @@ fn process_cups_raster_to_spl<W: Write>(
             placement.src_skip
         );
 
-        // Doğrulama bilinmeyen ölçüleri zaten reddetti; bu ikinci kontrol,
-        // dönüşüm ileride doğrulamadan ayrılırsa A4'e sessiz bir geri düşüşü
-        // engeller.
-        let paper_size = SplPaperSize::from_dimensions_pt_exact(
-            header.page_size_points[0],
-            header.page_size_points[1],
-        )
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Doğrulanmış kâğıt ölçüsü QPDL koduna dönüştürülemedi",
-            )
-        })?;
-
         // Kağıt kaynağı PPD'nin `*InputSlot` seçeneğinden `MediaPosition`
         // üzerinden gelir.
         let paper_source = match SplPaperSource::from_media_position(header.media_position) {
@@ -583,26 +578,11 @@ fn process_cups_raster_to_spl<W: Write>(
             }
         };
 
-        let resolution_x =
-            SplResolution::from_dpi_exact(header.hw_resolution[0]).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Yatay çözünürlük QPDL koduna dönüştürülemedi",
-                )
-            })?;
-        let resolution_y =
-            SplResolution::from_dpi_exact(header.hw_resolution[1]).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Dikey çözünürlük QPDL koduna dönüştürülemedi",
-                )
-            })?;
-
         spl_writer.begin_page(&PageConfig {
-            paper_size,
+            paper_size: geometry.paper_size,
             paper_source,
-            resolution_x,
-            resolution_y,
+            resolution_x: geometry.resolution_x,
+            resolution_y: geometry.resolution_y,
             copies,
             // SpliX qpdl.cpp renderPage: width = page->width() = pageWidth
             width_pixels: band_width_u16,
@@ -614,7 +594,6 @@ fn process_cups_raster_to_spl<W: Write>(
             &mut spl_writer,
             &header,
             band_width_u16,
-            band_width_bytes,
             placement,
             cancel,
         )?;
@@ -644,18 +623,19 @@ fn process_cups_raster_to_spl<W: Write>(
 /// Bir sayfanın raster satırlarını SpliX uyumlu şeritler hâlinde yazar:
 /// satırları `BandPlacement`e göre transpoze bant tamponuna kopyalar, tersler,
 /// Algo 0x11 ile sıkıştırıp şerit kaydı olarak gönderir.
+///
+/// `band_width_pixels` tam bayt hizalıdır (bkz. `compute_page_width_pixels`).
 fn stream_page_bands<R: Read, W: Write>(
     raster_reader: &mut CupsRasterReader<R>,
     spl_writer: &mut SplStreamWriter<W>,
     header: &PageHeader,
     band_width_pixels: u16,
-    band_width_bytes: u32,
     placement: BandPlacement,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
     let cups_bytes_per_line = header.bytes_per_line as usize;
     let total_lines = header.height as usize;
-    let bw_bytes = band_width_bytes as usize;
+    let bw_bytes = band_width_pixels as usize / 8;
 
     let band_height = band_height_for(header);
 
@@ -762,10 +742,9 @@ mod tests {
     use raster::CupsRasterVersion;
     use std::io::Cursor;
 
-    /// Argümansız (doğrudan boru hattı) çağrıyı temsil eder.
-    fn no_args() -> CupsFilterArgs {
-        CupsFilterArgs::default()
-    }
+    /// PPD'deki en yüksek `*Resolution` seçeneği; `MAX_BYTES_PER_LINE` ve
+    /// `MAX_LINES` bu değerden türetildi.
+    const MAX_DPI: u32 = 1200;
 
     /// Projenin PPD dosyasını okur. Aşağıdaki testlerin bir bölümü, filtrenin
     /// sabitlerini PPD'nin gerçek içeriğine bağlar: PPD'ye yeni bir seçenek
@@ -849,22 +828,13 @@ mod tests {
         assert_eq!(sanitize_copies(u32::MAX), MAX_REALISTIC_COPIES);
     }
 
-    /// A4, 600 DPI, 1-bit monokrom (K), tutarlı `bytesPerLine`'a sahip
-    /// geçerli bir başlık üretir; testler bunu temel alıp tek bir alanı
-    /// bozarak `validate_page_header`'ın onu reddettiğini doğrular.
+    /// A4, 600 DPI, 1-bit monokrom (K), 8x8 piksellik geçerli bir başlık
+    /// üretir; testler bunu temel alıp tek bir alanı bozarak
+    /// `validate_page_header`'ın onu reddettiğini doğrular.
     fn valid_header() -> PageHeader {
-        let mut buf = vec![0u8; 1796];
-        buf[276..280].copy_from_slice(&600u32.to_be_bytes()); // hw_resolution[0]
-        buf[280..284].copy_from_slice(&600u32.to_be_bytes()); // hw_resolution[1]
-        buf[352..356].copy_from_slice(&595u32.to_be_bytes()); // page_size_points[0] (A4)
-        buf[356..360].copy_from_slice(&842u32.to_be_bytes()); // page_size_points[1]
-        buf[372..376].copy_from_slice(&8u32.to_be_bytes()); // width
-        buf[376..380].copy_from_slice(&8u32.to_be_bytes()); // height
-        buf[384..388].copy_from_slice(&1u32.to_be_bytes()); // bits_per_color
-        buf[388..392].copy_from_slice(&1u32.to_be_bytes()); // bits_per_pixel
-        buf[392..396].copy_from_slice(&1u32.to_be_bytes()); // bytes_per_line = ceil(8*1/8)
-        buf[400..404].copy_from_slice(&3u32.to_be_bytes()); // color_space = K
-        PageHeader::parse(&buf, CupsRasterVersion::V2Be).unwrap()
+        let mut spec = RasterSpec::a4(600, 600, 8);
+        spec.width_px = 8;
+        PageHeader::parse(&spec.header_bytes(), CupsRasterVersion::V3Be).unwrap()
     }
 
     #[test]
@@ -925,35 +895,21 @@ mod tests {
         assert!(validate_page_header(&header).is_err());
     }
 
-    /// Geçerli, tek sayfalık, sıkıştırmasız bir V3 Big-Endian raster akışı
-    /// üretir. `pixel_bytes`, sayfa verisinin kaç baytının yazılacağını
-    /// belirler; başlıkta bildirilenden az vermek kısa okuma (hata) yolunu
-    /// tetikler.
+    /// Geçerli, tek sayfalık (A4 @600 DPI, 32x4 piksel), sıkıştırmasız bir V3
+    /// Big-Endian raster akışı üretir. `pixel_bytes`, sayfa verisinin kaç
+    /// baytının yazılacağını belirler; başlıkta bildirilen 16 bayttan az
+    /// vermek kısa okuma (hata) yolunu tetikler.
     fn v3_stream(pixel_bytes: usize) -> Vec<u8> {
-        let mut buf = vec![0u8; 1796];
-        let mut put = |off: usize, val: u32| {
-            buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
-        };
-        put(276, 600); // hw_resolution[0]
-        put(280, 600); // hw_resolution[1]
-        put(352, 595); // page_size_points[0] (A4)
-        put(356, 842); // page_size_points[1]
-        put(372, 32); // width
-        put(376, 4); // height
-        put(384, 1); // bits_per_color
-        put(388, 1); // bits_per_pixel
-        put(392, 4); // bytes_per_line = ceil(32 * 1 / 8)
-        put(400, 3); // color_space = K
-
-        let mut stream = b"RaS3".to_vec();
-        stream.extend_from_slice(&buf);
-        stream.extend_from_slice(&vec![0u8; pixel_bytes]);
+        let mut spec = RasterSpec::a4(600, 600, 4);
+        spec.width_px = 32;
+        let mut stream = spec.build();
+        stream.truncate(4 + 1796 + pixel_bytes);
         stream
     }
 
-    /// İstenen geometri/duplex ile çok sayfalı, sıkıştırmasız (v3) bir CUPS
-    /// Raster akışı kurar. `v3_stream` sabit A4/600 DPI üretiyor; bu esnek
-    /// sürüm geometriyi ve seçenekleri değiştirebilmek için var.
+    /// İstenen geometri ve seçeneklerle çok sayfalı, sıkıştırmasız (v3) bir
+    /// CUPS Raster akışı kurar. Testlerdeki bütün raster başlıkları buradan
+    /// üretilir.
     struct RasterSpec {
         res_x: u32,
         res_y: u32,
@@ -994,39 +950,45 @@ mod tests {
             self.width_px.div_ceil(8)
         }
 
+        /// 1796 baytlık Big-Endian `cups_page_header2_t`.
+        fn header_bytes(&self) -> Vec<u8> {
+            let mut buf = vec![0u8; 1796];
+            let mut put = |off: usize, val: u32| {
+                buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+            };
+            put(276, self.res_x); // hw_resolution[0]
+            put(280, self.res_y); // hw_resolution[1]
+            put(312, self.margin_left_pt); // Margins[0] (sol, pt)
+            put(324, self.media_position);
+            put(352, self.page_pt.0); // page_size_points[0]
+            put(356, self.page_pt.1); // page_size_points[1]
+            put(372, self.width_px);
+            put(376, self.height);
+            put(384, 1); // bits_per_color
+            put(388, 1); // bits_per_pixel
+            put(392, self.bytes_per_line());
+            put(400, 3); // color_space = K
+            let media_type = self.media_type.as_bytes();
+            buf[128..128 + media_type.len()].copy_from_slice(media_type);
+            buf
+        }
+
         fn build(&self) -> Vec<u8> {
+            let header = self.header_bytes();
+            let line = match &self.line_pattern {
+                Some(pattern) => {
+                    assert_eq!(
+                        pattern.len(),
+                        self.bytes_per_line() as usize,
+                        "desen satır uzunluğuyla uyuşmuyor"
+                    );
+                    pattern.clone()
+                }
+                None => vec![0u8; self.bytes_per_line() as usize],
+            };
             let mut stream = b"RaS3".to_vec();
             for _ in 0..self.pages {
-                let mut buf = vec![0u8; 1796];
-                let mut put = |off: usize, val: u32| {
-                    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
-                };
-                put(312, self.margin_left_pt); // Margins[0] (sol, pt)
-                put(324, self.media_position);
-                put(276, self.res_x);
-                put(280, self.res_y);
-                put(352, self.page_pt.0);
-                put(356, self.page_pt.1);
-                put(372, self.width_px);
-                put(376, self.height);
-                put(384, 1); // bits_per_color
-                put(388, 1); // bits_per_pixel
-                put(392, self.bytes_per_line());
-                put(400, 3); // color_space = K
-                let media_type = self.media_type.as_bytes();
-                buf[128..128 + media_type.len()].copy_from_slice(media_type);
-                stream.extend_from_slice(&buf);
-                let line = match &self.line_pattern {
-                    Some(pattern) => {
-                        assert_eq!(
-                            pattern.len(),
-                            self.bytes_per_line() as usize,
-                            "desen satır uzunluğuyla uyuşmuyor"
-                        );
-                        pattern.clone()
-                    }
-                    None => vec![0u8; self.bytes_per_line() as usize],
-                };
+                stream.extend_from_slice(&header);
                 for _ in 0..self.height {
                     stream.extend_from_slice(&line);
                 }
@@ -1137,23 +1099,32 @@ mod tests {
         pages
     }
 
-    fn run_filter(stream: Vec<u8>) -> Vec<u8> {
+    /// Filtreyi bellekteki bir akış üzerinde, argümansız (doğrudan boru hattı)
+    /// ve iptalsiz çalıştırır; sonucu ve yazıcıya giden baytları döner.
+    ///
+    /// İptal bayrağı yereldir: süreç geneli `cancel::REQUESTED`'ı kaldıran bir
+    /// test, paralel çalışan diğer testleri de iptal ederdi.
+    fn try_run_filter(stream: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         let mut out: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(stream)),
+        let result = process_cups_raster_to_spl(
+            &CupsFilterArgs::default(),
+            Cursor::new(stream),
             &mut out,
-            &not_cancelled(),
-        )
-        .expect("filtre geçerli akışı işleyemedi");
+            &AtomicBool::new(false),
+        );
+        (result, out)
+    }
+
+    /// `try_run_filter`'ın, akışın geçerli olmasını bekleyen hâli.
+    fn run_filter(stream: Vec<u8>) -> Vec<u8> {
+        let (result, out) = try_run_filter(stream);
+        result.expect("filtre geçerli akışı işleyemedi");
         out
     }
 
-    /// Testlerin geçirdiği iptal bayrağı. Süreç geneli `cancel::REQUESTED`
-    /// kullanılmıyor, çünkü onu kaldıran bir test paralel çalışan diğer
-    /// testleri de iptal ederdi.
-    fn not_cancelled() -> AtomicBool {
-        AtomicBool::new(false)
+    /// Çıktının başındaki PJL iş başlığı, metin olarak.
+    fn pjl_text(out: &[u8]) -> String {
+        String::from_utf8_lossy(&out[..qpdl_start(out)]).into_owned()
     }
 
     /// Girdinin ilk `threshold` baytı okunduğunda iptal bayrağını kaldıran
@@ -1184,7 +1155,7 @@ mod tests {
             flag: flag.clone(),
         };
         let mut out: Vec<u8> = Vec::new();
-        let err = process_cups_raster_to_spl(&no_args(), Box::new(reader), &mut out, &flag)
+        let err = process_cups_raster_to_spl(&CupsFilterArgs::default(), reader, &mut out, &flag)
             .expect_err("iptal edilen iş hata döndürmeliydi");
         (err, out)
     }
@@ -1201,15 +1172,9 @@ mod tests {
     /// dilinde yarım bir bant kaydını bekler hâlde kalır.
     #[test]
     fn test_closing_uel_written_on_truncated_page_data() {
-        let stream = v3_stream(2); // 4 satır x 4 bayt = 16 bayt gerekiyordu
-        let mut out: Vec<u8> = Vec::new();
-        let err = process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(stream)),
-            &mut out,
-            &not_cancelled(),
-        )
-        .expect_err("kısa sayfa verisi hata döndürmeliydi");
+        // 4 satır x 4 bayt = 16 bayt gerekiyordu
+        let (result, out) = try_run_filter(v3_stream(2));
+        let err = result.expect_err("kısa sayfa verisi hata döndürmeliydi");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
         assert!(
             out.ends_with(spl::PJL_END),
@@ -1225,14 +1190,8 @@ mod tests {
         // bytes_per_line'ı 0 yap: validate_page_header reddedecek.
         stream[4 + 392..4 + 396].copy_from_slice(&0u32.to_be_bytes());
 
-        let mut out: Vec<u8> = Vec::new();
-        let err = process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(stream)),
-            &mut out,
-            &not_cancelled(),
-        )
-        .expect_err("geçersiz başlık hata döndürmeliydi");
+        let (result, out) = try_run_filter(stream);
+        let err = result.expect_err("geçersiz başlık hata döndürmeliydi");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(out.ends_with(spl::PJL_END));
     }
@@ -1241,14 +1200,8 @@ mod tests {
     /// QPDL diline sokmuştur.
     #[test]
     fn test_closing_uel_written_when_stream_has_no_pages() {
-        let mut out: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(b"RaS3".to_vec())),
-            &mut out,
-            &not_cancelled(),
-        )
-        .expect("sayfasız akış hata değil, uyarı üretmeli");
+        let (result, out) = try_run_filter(b"RaS3".to_vec());
+        result.expect("sayfasız akış hata değil, uyarı üretmeli");
         assert!(out.ends_with(spl::PJL_END));
         assert_eq!(count_uel(&out), 2);
     }
@@ -1257,14 +1210,7 @@ mod tests {
     /// bir işe üçüncü bir UEL eklememelidir.
     #[test]
     fn test_successful_stream_has_exactly_one_uel_pair() {
-        let mut out: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(v3_stream(16))),
-            &mut out,
-            &not_cancelled(),
-        )
-        .expect("geçerli akış başarılı olmalı");
+        let out = run_filter(v3_stream(16));
         assert!(out.starts_with(spl::PJL_UEL));
         assert!(out.ends_with(spl::PJL_END));
         assert_eq!(count_uel(&out), 2, "fazladan UEL yazıldı");
@@ -1336,22 +1282,9 @@ mod tests {
             &[0xFF, 0xFF, 0xFF, 0xFF],
         ];
 
-        let mut hdr = vec![0u8; 1796];
-        {
-            let mut put = |off: usize, val: u32| {
-                hdr[off..off + 4].copy_from_slice(&val.to_be_bytes());
-            };
-            put(276, 600);
-            put(280, 600);
-            put(352, 595);
-            put(356, 842);
-            put(372, 32);
-            put(376, 3);
-            put(384, 1);
-            put(388, 1);
-            put(392, 4);
-            put(400, 3);
-        }
+        let mut spec = RasterSpec::a4(600, 600, 3);
+        spec.width_px = 32;
+        let hdr = spec.header_bytes();
 
         let mut v3 = b"RaS3".to_vec();
         v3.extend_from_slice(&hdr);
@@ -1366,22 +1299,8 @@ mod tests {
         v2.extend_from_slice(&[0x00, 0x80]); // satır sonuna kadar boş (K => 0x00)
         v2.extend_from_slice(&[0x00, 0x03, 0xFF]); // 0xFF x4
 
-        let mut out_v3: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(v3)),
-            &mut out_v3,
-            &not_cancelled(),
-        )
-        .expect("v3 akışı işlenmeli");
-        let mut out_v2: Vec<u8> = Vec::new();
-        process_cups_raster_to_spl(
-            &no_args(),
-            Box::new(Cursor::new(v2)),
-            &mut out_v2,
-            &not_cancelled(),
-        )
-        .expect("v2 akışı işlenmeli");
+        let out_v3 = run_filter(v3);
+        let out_v2 = run_filter(v2);
 
         assert!(!out_v3.is_empty());
         assert_eq!(out_v2, out_v3, "v2 ve v3 çıktıları ayrıştı");
@@ -1398,7 +1317,7 @@ mod tests {
     fn test_limits_cover_every_ppd_option() {
         for (x_dpi, y_dpi) in ppd_resolutions() {
             assert!(
-                SplResolution::pair_is_supported(x_dpi, y_dpi),
+                SplResolution::from_dpi_pair(x_dpi, y_dpi).is_some(),
                 "PPD {}x{} DPI sunuyor ama filtre bu çifti desteklemiyor",
                 x_dpi,
                 y_dpi
@@ -1555,7 +1474,7 @@ mod tests {
     #[test]
     fn test_validate_page_header_height_slack_is_eight_lines() {
         // 842 pt @ 600 DPI => ceil(842 * 600 / 72) = 7017 satır.
-        let exact = compute_page_height_lines(842, 600);
+        let exact = points_to_pixels(842, 600);
         assert_eq!(exact, 7017);
 
         let mut ok = valid_header();
@@ -1760,14 +1679,15 @@ mod tests {
         );
     }
 
-    /// Yükseklik sınırı dikey çözünürlüğe bağlı olmalı: `compute_page_height_lines`
-    /// `hw_resolution[1]`'i alır, `[0]`'ı değil. 1200x600 desteklenen bir mod
-    /// olduğundan iki eksenin birbirinden bağımsız kullanılması gerekir.
+    /// Yükseklik sınırı dikey çözünürlüğe bağlı olmalı: `validate_page_header`
+    /// sayfa yüksekliğini `hw_resolution[1]` ile hesaplar, `[0]` ile değil.
+    /// 1200x600 desteklenen bir mod olduğundan iki eksenin birbirinden bağımsız
+    /// kullanılması gerekir.
     #[test]
     fn test_page_height_lines_uses_vertical_resolution() {
-        assert_eq!(compute_page_height_lines(842, 600), 7017);
-        assert_eq!(compute_page_height_lines(842, 300), 3509);
-        assert_eq!(compute_page_height_lines(842, 1200), 14034);
+        assert_eq!(points_to_pixels(842, 600), 7017);
+        assert_eq!(points_to_pixels(842, 300), 3509);
+        assert_eq!(points_to_pixels(842, 1200), 14034);
 
         // Sınır gerçekten çözünürlükle ölçekleniyor: 600 DPI'da geçerli olan
         // bir yükseklik, aynı kağıtta 300 DPI'da reddedilmeli.
@@ -1850,38 +1770,18 @@ mod tests {
         );
     }
 
-    /// Belirtilen sayıda küçük, geçerli sayfadan (A6 @ 300 DPI, 8x1 piksel)
-    /// oluşan bir V3 akışı üretir.
-    fn v3_multipage_stream(pages: u32) -> Vec<u8> {
-        let mut page = vec![0u8; 1796];
-        {
-            let mut put = |off: usize, val: u32| {
-                page[off..off + 4].copy_from_slice(&val.to_be_bytes());
-            };
-            put(276, 300); // hw_resolution
-            put(280, 300);
-            put(352, 297); // page_size_points: A6
-            put(356, 420);
-            put(372, 8); // width
-            put(376, 1); // height
-            put(384, 1); // bits_per_color
-            put(388, 1); // bits_per_pixel
-            put(392, 1); // bytes_per_line
-            put(400, 3); // color_space = K
-        }
-        let mut stream = b"RaS3".to_vec();
-        for _ in 0..pages {
-            stream.extend_from_slice(&page);
-            stream.push(0u8); // 1 satır x 1 bayt
-        }
-        stream
-    }
-
     /// İşin sayfa sayısına filtre bir üst sınır koymaz; kota gerekiyorsa
     /// CUPS'ın kendi `job-page-limit` seçeneği kullanılır.
     #[test]
     fn test_long_jobs_are_not_capped() {
-        let pages = parse_spl(&run_filter(v3_multipage_stream(1_500)));
+        // 1500 küçük sayfa: A6 @ 300 DPI, 8x1 piksel.
+        let spec = RasterSpec {
+            page_pt: (297, 420),
+            width_px: 8,
+            pages: 1_500,
+            ..RasterSpec::a4(300, 300, 1)
+        };
+        let pages = parse_spl(&run_filter(spec.build()));
         assert_eq!(pages.len(), 1_500);
     }
 
@@ -2001,7 +1901,7 @@ mod tests {
         let mut spec = RasterSpec::a4(600, 600, 8);
         spec.pages = 3;
         let out = run_filter(spec.build());
-        let pjl = String::from_utf8_lossy(&out[..out.len().min(512)]).into_owned();
+        let pjl = pjl_text(&out);
         assert!(pjl.contains("@PJL SET DUPLEX=OFF\n"), "PJL: {}", pjl);
         assert!(!pjl.contains("BINDING"), "PJL: {}", pjl);
         let pages = parse_spl(&out);
@@ -2224,7 +2124,7 @@ mod tests {
             let mut spec = RasterSpec::a4(600, 600, 8);
             spec.media_type = media_type;
             let out = run_filter(spec.build());
-            let pjl = String::from_utf8_lossy(&out[..out.len().min(512)]).into_owned();
+            let pjl = pjl_text(&out);
             assert!(
                 pjl.contains(&format!("@PJL SET PAPERTYPE={}\n", media_type)),
                 "{} PJL'e ulaşmadı: {}",
@@ -2243,7 +2143,7 @@ mod tests {
             let mut spec = RasterSpec::a4(600, 600, 8);
             spec.media_type = media_type;
             let out = run_filter(spec.build());
-            let pjl = String::from_utf8_lossy(&out[..out.len().min(512)]).into_owned();
+            let pjl = pjl_text(&out);
             assert!(
                 pjl.contains("@PJL SET PAPERTYPE=OFF\n"),
                 "{:?} için OFF'a düşülmedi: {}",

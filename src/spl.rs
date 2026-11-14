@@ -100,42 +100,31 @@ impl SplPaperSource {
     }
 }
 
-/// Eksen başına QPDL çözünürlüğü.
+/// Eksen başına QPDL çözünürlüğü. Değer, sayfa başlığına yazılan koddur
+/// (SpliX qpdl.cpp: `resolution / 100`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SplResolution {
-    Dpi300,
-    Dpi600,
-    Dpi1200,
+    Dpi300 = 3,
+    Dpi600 = 6,
+    Dpi1200 = 12,
 }
 
 impl SplResolution {
-    #[inline]
-    pub fn dpi(&self) -> u32 {
-        match self {
-            SplResolution::Dpi300 => 300,
-            SplResolution::Dpi600 => 600,
-            SplResolution::Dpi1200 => 1200,
-        }
-    }
-
-    /// Yalnızca tam 300/600/1200 değerlerini dönüştürür; yakındaki değere
-    /// yuvarlamak, raster geometrisiyle uyuşmayan bir DPI bildirmek olurdu.
-    pub fn from_dpi_exact(dpi: u32) -> Option<Self> {
-        match dpi {
-            300 => Some(SplResolution::Dpi300),
-            600 => Some(SplResolution::Dpi600),
-            1200 => Some(SplResolution::Dpi1200),
-            _ => None,
-        }
-    }
-
-    /// PPD'nin sunduğu çözünürlük çiftleri. Eksenleri ayrı ayrı doğrulamak
-    /// yetmez: 600x1200 iki tanınan eksenden oluşur ama bir yazıcı modu değildir.
-    pub fn pair_is_supported(x_dpi: u32, y_dpi: u32) -> bool {
-        matches!(
-            (x_dpi, y_dpi),
-            (300, 300) | (600, 600) | (1200, 600) | (1200, 1200)
-        )
+    /// PPD'nin sunduğu çözünürlük çiftini (yatay, dikey) dönüştürür.
+    ///
+    /// Yalnızca tam değerler eşlenir; yakındaki değere yuvarlamak, raster
+    /// geometrisiyle uyuşmayan bir DPI bildirmek olurdu. Eksenler de ayrı ayrı
+    /// değil çift olarak eşlenir: 600x1200 iki tanınan eksenden oluşur ama bir
+    /// yazıcı modu değildir.
+    pub fn from_dpi_pair(x_dpi: u32, y_dpi: u32) -> Option<(Self, Self)> {
+        Some(match (x_dpi, y_dpi) {
+            (300, 300) => (SplResolution::Dpi300, SplResolution::Dpi300),
+            (600, 600) => (SplResolution::Dpi600, SplResolution::Dpi600),
+            (1200, 600) => (SplResolution::Dpi1200, SplResolution::Dpi600),
+            (1200, 1200) => (SplResolution::Dpi1200, SplResolution::Dpi1200),
+            _ => return None,
+        })
     }
 }
 
@@ -208,17 +197,6 @@ pub struct JobConfig {
     pub paper_type: &'static str,
 }
 
-impl Default for JobConfig {
-    fn default() -> Self {
-        Self {
-            job_name: "CUPS Document".to_string(),
-            user_name: "guest".to_string(),
-            service_date: current_service_date(),
-            paper_type: PJL_PAPERTYPE_DEFAULT,
-        }
-    }
-}
-
 /// Sayfa Konfigürasyonu
 #[derive(Debug, Clone)]
 pub struct PageConfig {
@@ -237,21 +215,6 @@ pub struct PageConfig {
     /// `u16` olması, çağıranı daraltmayı (`try_from`) açıkça ele almaya zorlar.
     pub width_pixels: u16,
     pub height_pixels: u16,
-}
-
-impl Default for PageConfig {
-    /// A4 @ 600 DPI, tek kopya, kaset.
-    fn default() -> Self {
-        Self {
-            paper_size: SplPaperSize::A4,
-            paper_source: SplPaperSource::Auto,
-            resolution_x: SplResolution::Dpi600,
-            resolution_y: SplResolution::Dpi600,
-            copies: 1,
-            width_pixels: 4960,
-            height_pixels: 6817,
-        }
-    }
 }
 
 // ============================================================================
@@ -550,7 +513,7 @@ impl<W: Write> SplStreamWriter<W> {
 
         let mut header = [0u8; 17];
         header[0x0] = 0x00; // Sayfa başlığı imzası
-        header[0x1] = (config.resolution_y.dpi() / 100) as u8; // DİKEY çözünürlük / 100
+        header[0x1] = config.resolution_y as u8; // DİKEY çözünürlük / 100
         header[0x2..0x4].copy_from_slice(&config.copies.to_be_bytes());
         header[0x4] = config.paper_size as u8;
         header[0x5..0x7].copy_from_slice(&config.width_pixels.to_be_bytes());
@@ -564,7 +527,7 @@ impl<W: Write> SplStreamWriter<W> {
         header[0xD] = 0x00; // unknownByte2
         header[0xE] = QPDL_VERSION;
         header[0xF] = 0x01; // Renk düzlemi sayısı (monokrom)
-        header[0x10] = (config.resolution_x.dpi() / 100) as u8; // YATAY çözünürlük / 100
+        header[0x10] = config.resolution_x as u8; // YATAY çözünürlük / 100
 
         self.writer.write_all(&header)?;
         Ok(())
@@ -659,17 +622,41 @@ impl<W: Write> SplStreamWriter<W> {
 /// döner. SIGTERM'in de bu yoldan geçmesi için bkz. cancel.rs.
 impl<W: Write> Drop for SplStreamWriter<W> {
     fn drop(&mut self) {
-        if self.job_active {
-            // Hatayı raporlayacak bir yer yok; akışı kapatmayı denemek yine
-            // de hiç denememekten iyidir.
-            let _ = self.end_job();
-        }
+        // `end_job` iş açık değilse hiçbir şey yazmaz. Hatayı raporlayacak bir
+        // yer yok; akışı kapatmayı denemek yine de hiç denememekten iyidir.
+        let _ = self.end_job();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Default for JobConfig {
+        fn default() -> Self {
+            Self {
+                job_name: "CUPS Document".to_string(),
+                user_name: "guest".to_string(),
+                service_date: current_service_date(),
+                paper_type: PJL_PAPERTYPE_DEFAULT,
+            }
+        }
+    }
+
+    impl Default for PageConfig {
+        /// A4 @ 600 DPI, tek kopya, kaset.
+        fn default() -> Self {
+            Self {
+                paper_size: SplPaperSize::A4,
+                paper_source: SplPaperSource::Auto,
+                resolution_x: SplResolution::Dpi600,
+                resolution_y: SplResolution::Dpi600,
+                copies: 1,
+                width_pixels: 4960,
+                height_pixels: 6817,
+            }
+        }
+    }
 
     /// QPDL bant sırası alanı 8 bitliktir; 257. bant sessizce 0'a sarmak
     /// yerine hata vermeli. Bugün erişilemez (en kötü durum 170 bant), ama
@@ -717,31 +704,24 @@ mod tests {
     }
 
     /// DPI dönüşümü yaklaşık değerleri sessizce 300/600/1200'e yuvarlamamalı;
-    /// yalnızca PPD'nin sunduğu eksen değerleri ve doğrulanmış çiftler geçerli.
+    /// yalnızca PPD'nin sunduğu çiftler geçerli.
     #[test]
     fn test_resolution_mapping_is_exact_and_pair_aware() {
-        assert_eq!(
-            SplResolution::from_dpi_exact(300),
-            Some(SplResolution::Dpi300)
-        );
-        assert_eq!(
-            SplResolution::from_dpi_exact(600),
-            Some(SplResolution::Dpi600)
-        );
-        assert_eq!(
-            SplResolution::from_dpi_exact(1200),
-            Some(SplResolution::Dpi1200)
-        );
-        for unsupported in [0, 299, 599, 601, 1199, 1201] {
-            assert_eq!(SplResolution::from_dpi_exact(unsupported), None);
-        }
+        use SplResolution::{Dpi1200, Dpi300, Dpi600};
 
-        assert!(SplResolution::pair_is_supported(300, 300));
-        assert!(SplResolution::pair_is_supported(600, 600));
-        assert!(SplResolution::pair_is_supported(1200, 600));
-        assert!(SplResolution::pair_is_supported(1200, 1200));
-        assert!(!SplResolution::pair_is_supported(600, 1200));
-        assert!(!SplResolution::pair_is_supported(300, 600));
+        let pair = SplResolution::from_dpi_pair;
+        assert_eq!(pair(300, 300), Some((Dpi300, Dpi300)));
+        assert_eq!(pair(600, 600), Some((Dpi600, Dpi600)));
+        assert_eq!(pair(1200, 600), Some((Dpi1200, Dpi600)));
+        assert_eq!(pair(1200, 1200), Some((Dpi1200, Dpi1200)));
+
+        for unsupported in [0, 299, 599, 601, 1199, 1201] {
+            assert_eq!(pair(unsupported, unsupported), None);
+        }
+        // İki tanınan eksen, ama bir yazıcı modu değil.
+        for (x, y) in [(600, 1200), (300, 600), (600, 300), (1200, 300)] {
+            assert_eq!(pair(x, y), None, "{}x{}", x, y);
+        }
     }
 
     #[test]
@@ -1048,21 +1028,21 @@ mod tests {
         assert_eq!(out2[0x1], 12);
         assert_eq!(out2[0x10], 6);
 
-        // Simetrik modlarda iki bayt eşit.
-        for dpi in [
-            SplResolution::Dpi300,
-            SplResolution::Dpi600,
-            SplResolution::Dpi1200,
+        // Simetrik modlarda iki bayt eşit ve DPI / 100.
+        for (resolution, code) in [
+            (SplResolution::Dpi300, 3),
+            (SplResolution::Dpi600, 6),
+            (SplResolution::Dpi1200, 12),
         ] {
             let sym = PageConfig {
-                resolution_x: dpi,
-                resolution_y: dpi,
+                resolution_x: resolution,
+                resolution_y: resolution,
                 ..PageConfig::default()
             };
             let mut o: Vec<u8> = Vec::new();
             SplStreamWriter::new(&mut o).begin_page(&sym).unwrap();
-            assert_eq!(o[0x1], o[0x10]);
-            assert_eq!(o[0x1] as u32, dpi.dpi() / 100);
+            assert_eq!(o[0x1], code);
+            assert_eq!(o[0x10], code);
         }
     }
 
